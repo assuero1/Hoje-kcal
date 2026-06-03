@@ -426,6 +426,14 @@ function decimalFormat(value) {
   });
 }
 
+function parseLocalizedNumber(value) {
+  const normalizedValue = String(value ?? "")
+    .trim()
+    .replace(",", ".");
+  const parsedValue = Number(normalizedValue || 0);
+  return Number.isFinite(parsedValue) ? parsedValue : 0;
+}
+
 function startOfDayOffset(offset) {
   const now = new Date();
   now.setDate(now.getDate() - offset);
@@ -1092,8 +1100,9 @@ function CreatePanel({
           <label>
             Calorias
             <input
-              type="number"
-              min="0"
+              type="text"
+              inputMode="decimal"
+              pattern="[0-9]*[,.]?[0-9]*"
               value={draft.calories}
               onChange={(event) => setDraft((current) => ({ ...current, calories: event.target.value }))}
             />
@@ -1101,9 +1110,9 @@ function CreatePanel({
           <label>
             Proteina
             <input
-              type="number"
-              min="0"
-              step="0.1"
+              type="text"
+              inputMode="decimal"
+              pattern="[0-9]*[,.]?[0-9]*"
               value={draft.protein}
               onChange={(event) => setDraft((current) => ({ ...current, protein: event.target.value }))}
             />
@@ -1111,9 +1120,9 @@ function CreatePanel({
           <label>
             Carbo
             <input
-              type="number"
-              min="0"
-              step="0.1"
+              type="text"
+              inputMode="decimal"
+              pattern="[0-9]*[,.]?[0-9]*"
               value={draft.carbs}
               onChange={(event) => setDraft((current) => ({ ...current, carbs: event.target.value }))}
             />
@@ -1121,9 +1130,9 @@ function CreatePanel({
           <label>
             Gordura
             <input
-              type="number"
-              min="0"
-              step="0.1"
+              type="text"
+              inputMode="decimal"
+              pattern="[0-9]*[,.]?[0-9]*"
               value={draft.fat}
               onChange={(event) => setDraft((current) => ({ ...current, fat: event.target.value }))}
             />
@@ -1131,9 +1140,9 @@ function CreatePanel({
           <label>
             Fibra
             <input
-              type="number"
-              min="0"
-              step="0.1"
+              type="text"
+              inputMode="decimal"
+              pattern="[0-9]*[,.]?[0-9]*"
               value={draft.fiber}
               onChange={(event) => setDraft((current) => ({ ...current, fiber: event.target.value }))}
             />
@@ -1637,11 +1646,11 @@ export function App() {
         name: trimmedName,
         brand: draft.brand.trim(),
         defaultServingLabel: draft.defaultServingLabel.trim(),
-        calories: Number(draft.calories || 0),
-        protein: Number(draft.protein || 0),
-        carbs: Number(draft.carbs || 0),
-        fat: Number(draft.fat || 0),
-        fiber: Number(draft.fiber || 0),
+        calories: parseLocalizedNumber(draft.calories),
+        protein: parseLocalizedNumber(draft.protein),
+        carbs: parseLocalizedNumber(draft.carbs),
+        fat: parseLocalizedNumber(draft.fat),
+        fiber: parseLocalizedNumber(draft.fiber),
         updatedAt: now,
       };
 
@@ -1659,11 +1668,11 @@ export function App() {
       brand: draft.brand.trim(),
       defaultServingLabel: draft.defaultServingLabel.trim(),
       defaultServingGrams: null,
-      calories: Number(draft.calories || 0),
-      protein: Number(draft.protein || 0),
-      carbs: Number(draft.carbs || 0),
-      fat: Number(draft.fat || 0),
-      fiber: Number(draft.fiber || 0),
+      calories: parseLocalizedNumber(draft.calories),
+      protein: parseLocalizedNumber(draft.protein),
+      carbs: parseLocalizedNumber(draft.carbs),
+      fat: parseLocalizedNumber(draft.fat),
+      fiber: parseLocalizedNumber(draft.fiber),
       isFavorite: false,
       createdAt: now,
       updatedAt: now,
