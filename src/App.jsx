@@ -143,6 +143,14 @@ const seedFoods = [
 
 const quickAddIds = ["seed-ovo", "seed-frango", "seed-banana", "seed-iogurte"];
 
+function normalizeText(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
 function openDb() {
   return new Promise((resolve, reject) => {
     const request = window.indexedDB.open(STORAGE_DB_NAME, STORAGE_VERSION);
@@ -264,6 +272,73 @@ function sumNutrition(entries) {
   );
 }
 
+function nutritionFromProduct(product) {
+  const nutriments = product?.nutriments || {};
+  const servingGrams = Number.parseFloat(product?.serving_quantity) || 100;
+  const factor = servingGrams / 100;
+
+  const valueForServing = (key) => {
+    const servingValue = Number.parseFloat(nutriments[`${key}_serving`]);
+    if (Number.isFinite(servingValue)) {
+      return servingValue;
+    }
+
+    const per100gValue = Number.parseFloat(nutriments[`${key}_100g`]);
+    if (Number.isFinite(per100gValue)) {
+      return per100gValue * factor;
+    }
+
+    return 0;
+  };
+
+  return {
+    servingGrams,
+    calories: Math.round(valueForServing("energy-kcal")),
+    protein: Number(valueForServing("proteins").toFixed(1)),
+    carbs: Number(valueForServing("carbohydrates").toFixed(1)),
+    fat: Number(valueForServing("fat").toFixed(1)),
+    fiber: Number(valueForServing("fiber").toFixed(1)),
+  };
+}
+
+function productToFood(product, barcode) {
+  const nutrition = nutritionFromProduct(product);
+  const now = new Date().toISOString();
+  const name = product?.product_name_pt || product?.product_name || product?.generic_name_pt || product?.generic_name;
+  const servingLabel = product?.serving_size || `${nutrition.servingGrams || 100} g`;
+
+  return {
+    id: `barcode-${barcode}`,
+    barcode,
+    name: name || `Produto ${barcode}`,
+    brand: product?.brands?.split(",")?.[0]?.trim() || "Open Food Facts",
+    defaultServingLabel: servingLabel,
+    defaultServingGrams: nutrition.servingGrams || null,
+    calories: nutrition.calories,
+    protein: nutrition.protein,
+    carbs: nutrition.carbs,
+    fat: nutrition.fat,
+    fiber: nutrition.fiber,
+    isFavorite: false,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+async function fetchFoodByBarcode(barcode) {
+  const response = await fetch(`https://world.openfoodfacts.org/api/v2/product/${barcode}.json?fields=code,status,product_name,product_name_pt,generic_name,generic_name_pt,brands,serving_size,serving_quantity,nutriments`);
+  if (!response.ok) {
+    throw new Error("Nao foi possivel consultar o codigo de barras.");
+  }
+
+  const data = await response.json();
+  if (data.status !== 1 || !data.product) {
+    throw new Error("Produto nao encontrado na Open Food Facts.");
+  }
+
+  return productToFood(data.product, barcode);
+}
+
 function monthKey(date) {
   return `${date.getFullYear()}-${padDatePart(date.getMonth() + 1)}`;
 }
@@ -341,18 +416,6 @@ function createEntry(food, mealType, multiplier) {
     },
     createdAt: new Date().toISOString(),
   };
-}
-
-function buildSeedEntries() {
-  return [
-    createEntry(seedFoods[0], "breakfast", 2),
-    createEntry(seedFoods[6], "breakfast", 1),
-    createEntry(seedFoods[1], "lunch", 2),
-    createEntry(seedFoods[4], "lunch", 1.5),
-    createEntry(seedFoods[5], "lunch", 1),
-    createEntry(seedFoods[2], "snacks", 1),
-    createEntry(seedFoods[3], "snacks", 1),
-  ];
 }
 
 function Icon({ name }) {
@@ -512,7 +575,7 @@ function MacroPanel({ totals, settings }) {
     { key: "carbs", label: "Carbo", current: totals.carbs, target: settings.macroTargets.carbs },
     { key: "protein", label: "Proteina", current: totals.protein, target: settings.macroTargets.protein },
     { key: "fat", label: "Gordura", current: totals.fat, target: settings.macroTargets.fat },
-    { key: "fiber", label: "Fibra", current: totals.fiber || 18, target: settings.macroTargets.fiber || 30 },
+    { key: "fiber", label: "Fibra", current: totals.fiber || 0, target: settings.macroTargets.fiber || 30 },
   ];
 
   return (
@@ -612,12 +675,13 @@ function SearchPanel({
   query,
   setQuery,
   selectedMeal,
+  setSelectedMeal,
   onAddFood,
   onToggleFavorite,
 }) {
   const filteredFoods = foods.filter((food) => {
-    const haystack = `${food.name} ${food.brand}`.toLowerCase();
-    return haystack.includes(query.toLowerCase());
+    const haystack = normalizeText(`${food.name} ${food.brand} ${food.barcode || ""}`);
+    return haystack.includes(normalizeText(query));
   });
 
   return (
@@ -636,6 +700,15 @@ function SearchPanel({
           onChange={(event) => setQuery(event.target.value)}
           placeholder="Digite alimento ou marca"
         />
+      </label>
+
+      <label className="meal-select">
+        Refeicao para lancamento
+        <select value={selectedMeal} onChange={(event) => setSelectedMeal(event.target.value)}>
+          {Object.entries(mealLabels).map(([mealType, label]) => (
+            <option key={mealType} value={mealType}>{label}</option>
+          ))}
+        </select>
       </label>
 
       {filteredFoods.length ? (
@@ -796,6 +869,16 @@ function CreatePanel({ draft, setDraft, onCreateFood, duplicateError }) {
               onChange={(event) => setDraft((current) => ({ ...current, fat: event.target.value }))}
             />
           </label>
+          <label>
+            Fibra
+            <input
+              type="number"
+              min="0"
+              step="0.1"
+              value={draft.fiber}
+              onChange={(event) => setDraft((current) => ({ ...current, fiber: event.target.value }))}
+            />
+          </label>
         </div>
 
         {duplicateError ? <div className="form-alert">Ja existe um alimento com esse nome. Ajuste o cadastro para evitar duplicidade.</div> : null}
@@ -875,6 +958,20 @@ function ProfilePanel({ settings, setSettings, history }) {
                 setSettings((current) => ({
                   ...current,
                   macroTargets: { ...current.macroTargets, fat: Number(event.target.value) },
+                }))
+              }
+            />
+          </label>
+          <label>
+            Fibra alvo
+            <input
+              type="number"
+              min="0"
+              value={settings.macroTargets.fiber}
+              onChange={(event) =>
+                setSettings((current) => ({
+                  ...current,
+                  macroTargets: { ...current.macroTargets, fiber: Number(event.target.value) },
                 }))
               }
             />
@@ -1017,14 +1114,14 @@ function CalendarPanel({ entries, settings }) {
   );
 }
 
-function ActionPanel({ setActiveTab }) {
+function ActionPanel({ setActiveTab, onScanBarcode }) {
   return (
     <div className="action-panel">
       <button type="button" onClick={() => setActiveTab("search")}>
         <Icon name="search" />
         <span>Buscar alimentos</span>
       </button>
-      <button className="scan-action" type="button" onClick={() => setActiveTab("search")}>
+      <button className="scan-action" type="button" onClick={onScanBarcode}>
         <Icon name="barcode" />
         <span>Escanear codigo</span>
       </button>
@@ -1053,6 +1150,7 @@ export function App() {
     protein: "",
     carbs: "",
     fat: "",
+    fiber: "",
   });
 
   useEffect(() => {
@@ -1067,13 +1165,11 @@ export function App() {
       const savedSettings = settingsData.find((item) => item.key === "preferences");
 
       if (!seeded) {
-        const initialEntries = buildSeedEntries();
         await putMany(FOODS_STORE, seedFoods);
-        await putMany(ENTRIES_STORE, initialEntries);
         await putItem(SETTINGS_STORE, { key: SEED_KEY, value: true });
         await putItem(SETTINGS_STORE, { key: "preferences", value: defaultSettings });
         setFoods(seedFoods);
-        setEntries(initialEntries);
+        setEntries([]);
         setSettings(defaultSettings);
         return;
       }
@@ -1173,7 +1269,7 @@ export function App() {
       return;
     }
 
-    const exists = foods.some((food) => food.name.toLowerCase() === trimmedName.toLowerCase());
+    const exists = foods.some((food) => normalizeText(food.name) === normalizeText(trimmedName));
     if (exists) {
       setDuplicateError(true);
       return;
@@ -1190,7 +1286,7 @@ export function App() {
       protein: Number(draft.protein || 0),
       carbs: Number(draft.carbs || 0),
       fat: Number(draft.fat || 0),
-      fiber: 0,
+      fiber: Number(draft.fiber || 0),
       isFavorite: false,
       createdAt: now,
       updatedAt: now,
@@ -1205,8 +1301,35 @@ export function App() {
       protein: "",
       carbs: "",
       fat: "",
+      fiber: "",
     });
     setActiveTab("search");
+  }
+
+  async function scanBarcode() {
+    const barcode = window.prompt("Digite ou leia o codigo de barras do produto:");
+    const cleanBarcode = String(barcode || "").replace(/\D/g, "");
+
+    if (!cleanBarcode) {
+      return;
+    }
+
+    try {
+      const existingFood = foods.find((food) => food.barcode === cleanBarcode || food.id === `barcode-${cleanBarcode}`);
+      const scannedFood = existingFood || await fetchFoodByBarcode(cleanBarcode);
+
+      if (!existingFood) {
+        setFoods((current) => [scannedFood, ...current]);
+        await putItem(FOODS_STORE, scannedFood);
+      }
+
+      setQuery(cleanBarcode);
+      setActiveTab("search");
+      await addFood(scannedFood, selectedMeal);
+    } catch (error) {
+      window.alert(error.message || "Nao foi possivel buscar esse produto. Cadastre manualmente.");
+      setActiveTab("create");
+    }
   }
 
   function toggleFavorite(foodId) {
@@ -1301,7 +1424,7 @@ export function App() {
           </div>
         </section>
 
-        {activeTab === "today" ? <ActionPanel setActiveTab={setActiveTab} /> : null}
+        {activeTab === "today" ? <ActionPanel setActiveTab={setActiveTab} onScanBarcode={scanBarcode} /> : null}
 
         {activeTab === "search" ? (
           <SearchPanel
@@ -1309,6 +1432,7 @@ export function App() {
             query={query}
             setQuery={setQuery}
             selectedMeal={selectedMeal}
+            setSelectedMeal={setSelectedMeal}
             onAddFood={addFood}
             onToggleFavorite={toggleFavorite}
           />

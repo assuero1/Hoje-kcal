@@ -693,7 +693,8 @@ input {
 }
 
 .food-form label,
-.settings-card label {
+.settings-card label,
+.meal-select {
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -701,6 +702,10 @@ input {
   letter-spacing: 0.05em;
   font-size: 0.76rem;
   color: var(--muted);
+}
+
+.meal-select {
+  margin: 14px 0 0;
 }
 
 .form-grid {
