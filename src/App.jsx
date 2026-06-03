@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import Tesseract from "tesseract.js";
 
 const STORAGE_DB_NAME = "hoje-kcal-db";
 const STORAGE_VERSION = 1;
@@ -151,6 +152,79 @@ function normalizeText(value) {
     .replace(/[\u0300-\u036f]/g, "");
 }
 
+function numberFromOcr(value) {
+  const match = String(value || "").match(/\d+(?:[,.]\d+)?/);
+  if (!match) {
+    return "";
+  }
+  return match[0].replace(",", ".");
+}
+
+function extractLineValue(text, labels) {
+  const lines = String(text || "").split(/\n+/);
+  const normalizedLabels = labels.map(normalizeText);
+
+  for (const line of lines) {
+    const normalizedLine = normalizeText(line);
+    if (normalizedLabels.some((label) => normalizedLine.includes(label))) {
+      const value = numberFromOcr(line);
+      if (value !== "") {
+        return value;
+      }
+    }
+  }
+
+  return "";
+}
+
+function extractServingLabel(text) {
+  const lines = String(text || "").split(/\n+/);
+  const servingLine = lines.find((line) => {
+    const normalized = normalizeText(line);
+    return normalized.includes("porcao") || normalized.includes("serving") || normalized.includes("porcao de");
+  });
+
+  if (!servingLine) {
+    return "100 g";
+  }
+
+  const servingMatch = servingLine.match(/(\d+(?:[,.]\d+)?)\s*(g|gramas|ml|mililitros|unidades?|unid\.?|fatias?)/i);
+  if (!servingMatch) {
+    return servingLine.trim().slice(0, 40) || "100 g";
+  }
+
+  return `${servingMatch[1].replace(",", ".")} ${servingMatch[2].toLowerCase().replace("gramas", "g").replace("mililitros", "ml")}`;
+}
+
+function extractProductName(text) {
+  const ignored = ["informacao nutricional", "informacoes nutricionais", "tabela nutricional", "nutrition facts"];
+  const lines = String(text || "")
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter((line) => line.length >= 4 && !/\d/.test(line));
+
+  const candidate = lines.find((line) => !ignored.some((item) => normalizeText(line).includes(item)));
+  return candidate ? candidate.slice(0, 48) : "";
+}
+
+function parseNutritionOcrText(text) {
+  return {
+    name: extractProductName(text),
+    defaultServingLabel: extractServingLabel(text),
+    calories: extractLineValue(text, ["valor energetico", "calorias", "kcal", "energy"]),
+    protein: extractLineValue(text, ["proteina", "proteinas", "protein"]),
+    carbs: extractLineValue(text, ["carboidrato", "carboidratos", "carbohydrate", "carbohydrates"]),
+    fat: extractLineValue(text, ["gorduras totais", "gordura total", "total fat", "fat"]),
+    fiber: extractLineValue(text, ["fibra alimentar", "fibra", "fiber"]),
+  };
+}
+
+function mergeOcrDraft(current, parsed) {
+  return Object.fromEntries(
+    Object.entries(parsed).map(([key, value]) => [key, current[key] || value]),
+  );
+}
+
 function openDb() {
   return new Promise((resolve, reject) => {
     const request = window.indexedDB.open(STORAGE_DB_NAME, STORAGE_VERSION);
@@ -220,6 +294,113 @@ async function deleteItem(storeName, key) {
     request.onsuccess = () => resolve(true);
     request.onerror = () => reject(request.error);
   });
+}
+
+async function clearStore(storeName) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(storeName, "readwrite");
+    const store = transaction.objectStore(storeName);
+    const request = store.clear();
+    request.onsuccess = () => resolve(true);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function csvEscape(value) {
+  const stringValue = value == null ? "" : String(value);
+  if (/[",\n\r;]/.test(stringValue)) {
+    return `"${stringValue.replace(/"/g, '""')}"`;
+  }
+  return stringValue;
+}
+
+function csvRow(values) {
+  return values.map(csvEscape).join(";");
+}
+
+function parseCsvLine(line) {
+  const cells = [];
+  let current = "";
+  let insideQuotes = false;
+
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    const next = line[index + 1];
+
+    if (char === '"' && insideQuotes && next === '"') {
+      current += '"';
+      index += 1;
+    } else if (char === '"') {
+      insideQuotes = !insideQuotes;
+    } else if ((char === ";" || char === ",") && !insideQuotes) {
+      cells.push(current);
+      current = "";
+    } else {
+      current += char;
+    }
+  }
+
+  cells.push(current);
+  return cells;
+}
+
+function parseCsv(text) {
+  const lines = String(text || "").replace(/^\uFEFF/, "").split(/\r?\n/).filter(Boolean);
+  if (!lines.length) {
+    return [];
+  }
+
+  const headers = parseCsvLine(lines[0]).map((header) => header.trim());
+  return lines.slice(1).map((line) => {
+    const values = parseCsvLine(line);
+    return Object.fromEntries(headers.map((header, index) => [header, values[index] ?? ""]));
+  });
+}
+
+function backupRows({ foods, entries, settings }) {
+  const preferences = { key: "preferences", value: settings };
+  const seeded = { key: SEED_KEY, value: true };
+
+  return [
+    ...[preferences, seeded].map((item) => ({ type: "setting", payload: JSON.stringify(item) })),
+    ...foods.map((food) => ({ type: "food", payload: JSON.stringify(food) })),
+    ...entries.map((entry) => ({ type: "entry", payload: JSON.stringify(entry) })),
+  ];
+}
+
+function buildBackupCsv(data) {
+  return [
+    csvRow(["type", "payload"]),
+    ...backupRows(data).map((row) => csvRow([row.type, row.payload])),
+  ].join("\n");
+}
+
+function parseBackupCsv(text) {
+  const rows = parseCsv(text);
+  const next = { settings: defaultSettings, foods: [], entries: [], settingsRecords: [] };
+
+  rows.forEach((row) => {
+    const type = row.type;
+    const payload = JSON.parse(row.payload || "{}");
+
+    if (type === "setting") {
+      next.settingsRecords.push(payload);
+      if (payload.key === "preferences" && payload.value) {
+        next.settings = payload.value;
+      }
+    }
+
+    if (type === "food") {
+      next.foods.push(payload);
+    }
+
+    if (type === "entry") {
+      next.entries.push(payload);
+    }
+  });
+
+  return next;
 }
 
 function padDatePart(value) {
@@ -498,6 +679,14 @@ function Icon({ name }) {
       </svg>
     );
   }
+  if (name === "camera") {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M5 8h3l1.6-2h4.8L16 8h3a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2Z" {...common} />
+        <circle cx="12" cy="14" r="3.2" {...common} />
+      </svg>
+    );
+  }
   if (name === "pencil") {
     return (
       <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -678,6 +867,7 @@ function SearchPanel({
   setSelectedMeal,
   onAddFood,
   onToggleFavorite,
+  onEditFood,
 }) {
   const filteredFoods = foods.filter((food) => {
     const haystack = normalizeText(`${food.name} ${food.brand} ${food.barcode || ""}`);
@@ -723,6 +913,9 @@ function SearchPanel({
                 </small>
               </div>
               <div className="food-actions">
+                <button type="button" onClick={() => onEditFood(food)}>
+                  editar
+                </button>
                 <button type="button" onClick={() => onToggleFavorite(food.id)}>
                   {food.isFavorite ? "desfavoritar" : "favoritar"}
                 </button>
@@ -743,7 +936,7 @@ function SearchPanel({
   );
 }
 
-function FavoritesPanel({ foods, onAddFood, onToggleFavorite, selectedMeal }) {
+function FavoritesPanel({ foods, onAddFood, onToggleFavorite, onEditFood, selectedMeal }) {
   const favorites = foods.filter((food) => food.isFavorite);
 
   return (
@@ -765,6 +958,9 @@ function FavoritesPanel({ foods, onAddFood, onToggleFavorite, selectedMeal }) {
                 <small>{food.calories} kcal por porcao</small>
               </div>
               <div className="food-actions">
+                <button type="button" onClick={() => onEditFood(food)}>
+                  editar
+                </button>
                 <button type="button" onClick={() => onToggleFavorite(food.id)}>
                   remover estrela
                 </button>
@@ -785,15 +981,40 @@ function FavoritesPanel({ foods, onAddFood, onToggleFavorite, selectedMeal }) {
   );
 }
 
-function CreatePanel({ draft, setDraft, onCreateFood, duplicateError }) {
+function CreatePanel({
+  draft,
+  setDraft,
+  onCreateFood,
+  onCancelEditFood,
+  editingFoodId,
+  duplicateError,
+  barcodeFallback,
+  ocrState,
+  onSelectOcrImage,
+  onRunOcr,
+  onClearOcr,
+  onApplyOcr,
+}) {
   return (
     <section className="tab-panel">
       <div className="section-head">
         <div>
-          <p className="section-kicker">Cadastro</p>
-          <h2>Crie seus proprios alimentos</h2>
+          <p className="section-kicker">{editingFoodId ? "Edicao" : "Cadastro"}</p>
+          <h2>{editingFoodId ? "Edite os atributos" : "Crie seus proprios alimentos"}</h2>
         </div>
+        {editingFoodId ? (
+          <button className="section-toggle" type="button" onClick={onCancelEditFood}>
+            cancelar
+          </button>
+        ) : null}
       </div>
+
+      {barcodeFallback ? (
+        <div className="ocr-notice">
+          <strong>Produto nao encontrado pelo codigo {barcodeFallback}</strong>
+          <p>Use uma foto da tabela nutricional para preencher os campos abaixo e revise antes de salvar.</p>
+        </div>
+      ) : null}
 
       <form
         className="food-form"
@@ -802,6 +1023,44 @@ function CreatePanel({ draft, setDraft, onCreateFood, duplicateError }) {
           onCreateFood();
         }}
       >
+        {!editingFoodId ? <div className="ocr-card">
+          <div className="ocr-card-head">
+            <div>
+              <p className="section-kicker">OCR no cliente</p>
+              <h3>Foto da embalagem</h3>
+            </div>
+            <span>{ocrState.status === "reading" ? `${Math.round(ocrState.progress * 100)}%` : "local"}</span>
+          </div>
+          <label className="ocr-upload">
+            <Icon name="camera" />
+            <span>{ocrState.fileName || "Tirar foto ou escolher imagem da tabela nutricional"}</span>
+            <input type="file" accept="image/*" capture="environment" onChange={onSelectOcrImage} />
+          </label>
+          {ocrState.status === "reading" ? (
+            <div className="ocr-progress">
+              <div style={{ width: `${Math.round(ocrState.progress * 100)}%` }} />
+            </div>
+          ) : null}
+          <div className="ocr-actions">
+            <button type="button" onClick={onRunOcr} disabled={!ocrState.file || ocrState.status === "reading"}>
+              Ler foto
+            </button>
+            <button type="button" onClick={onApplyOcr} disabled={!ocrState.text || ocrState.status === "reading"}>
+              Aplicar leitura
+            </button>
+            <button type="button" onClick={onClearOcr} disabled={ocrState.status === "reading"}>
+              Limpar OCR
+            </button>
+          </div>
+          {ocrState.error ? <div className="form-alert">{ocrState.error}</div> : null}
+          {ocrState.text ? (
+            <details className="ocr-text">
+              <summary>Texto extraido para conferencia</summary>
+              <pre>{ocrState.text}</pre>
+            </details>
+          ) : null}
+        </div> : null}
+
         <label>
           Nome
           <input
@@ -885,14 +1144,14 @@ function CreatePanel({ draft, setDraft, onCreateFood, duplicateError }) {
 
         <button className="primary-cta" type="submit">
           <Icon name="pencil" />
-          Salvar alimento
+          {editingFoodId ? "Atualizar alimento" : "Salvar alimento"}
         </button>
       </form>
     </section>
   );
 }
 
-function ProfilePanel({ settings, setSettings, history }) {
+function ProfilePanel({ settings, setSettings, history, importStatus, onExportCsv, onImportCsv }) {
   return (
     <section className="tab-panel">
       <div className="section-head">
@@ -998,6 +1257,28 @@ function ProfilePanel({ settings, setSettings, history }) {
             </div>
           ))}
         </div>
+      </div>
+
+      <div className="backup-card">
+        <div className="section-head compact">
+          <div>
+            <p className="section-kicker">Backup CSV</p>
+            <h2>Importar e exportar tudo</h2>
+          </div>
+        </div>
+        <p>
+          Baixe ou restaure alimentos, historico de lancamentos e metas em um unico arquivo CSV.
+        </p>
+        <div className="backup-actions">
+          <button type="button" onClick={onExportCsv}>
+            Exportar CSV
+          </button>
+          <label>
+            Importar CSV
+            <input type="file" accept=".csv,text/csv" onChange={onImportCsv} />
+          </label>
+        </div>
+        {importStatus ? <div className="backup-status">{importStatus}</div> : null}
       </div>
     </section>
   );
@@ -1142,6 +1423,17 @@ export function App() {
   const [selectedMeal, setSelectedMeal] = useState("breakfast");
   const [query, setQuery] = useState("");
   const [duplicateError, setDuplicateError] = useState(false);
+  const [editingFoodId, setEditingFoodId] = useState(null);
+  const [barcodeFallback, setBarcodeFallback] = useState("");
+  const [importStatus, setImportStatus] = useState("");
+  const [ocrState, setOcrState] = useState({
+    file: null,
+    fileName: "",
+    progress: 0,
+    text: "",
+    status: "idle",
+    error: "",
+  });
   const [draft, setDraft] = useState({
     name: "",
     brand: "",
@@ -1262,6 +1554,61 @@ export function App() {
     setExpandedMeals((current) => Array.from(new Set([...current, mealType])));
   }
 
+  function applyOcrText(text) {
+    const parsed = parseNutritionOcrText(text);
+    setDraft((current) => ({ ...current, ...mergeOcrDraft(current, parsed) }));
+  }
+
+  function selectOcrImage(event) {
+    const file = event.target.files?.[0] || null;
+    setOcrState({
+      file,
+      fileName: file?.name || "",
+      progress: 0,
+      text: "",
+      status: file ? "ready" : "idle",
+      error: "",
+    });
+  }
+
+  async function runOcr() {
+    if (!ocrState.file) {
+      return;
+    }
+
+    setOcrState((current) => ({ ...current, progress: 0, status: "reading", error: "" }));
+
+    try {
+      const result = await Tesseract.recognize(ocrState.file, "por+eng", {
+        logger: (message) => {
+          if (message.status === "recognizing text") {
+            setOcrState((current) => ({ ...current, progress: message.progress || 0 }));
+          }
+        },
+      });
+
+      const text = result.data.text || "";
+      setOcrState((current) => ({ ...current, progress: 1, text, status: "done" }));
+      applyOcrText(text);
+    } catch (error) {
+      setOcrState((current) => ({
+        ...current,
+        status: "error",
+        error: error.message || "Nao foi possivel ler a imagem. Tente outra foto mais nitida.",
+      }));
+    }
+  }
+
+  function clearOcr() {
+    setOcrState({ file: null, fileName: "", progress: 0, text: "", status: "idle", error: "" });
+  }
+
+  function applyCurrentOcr() {
+    if (ocrState.text) {
+      applyOcrText(ocrState.text);
+    }
+  }
+
   function createFood() {
     setDuplicateError(false);
     const trimmedName = draft.name.trim();
@@ -1269,15 +1616,45 @@ export function App() {
       return;
     }
 
-    const exists = foods.some((food) => normalizeText(food.name) === normalizeText(trimmedName));
+    const exists = foods.some((food) =>
+      food.id !== editingFoodId && normalizeText(food.name) === normalizeText(trimmedName)
+    );
     if (exists) {
       setDuplicateError(true);
       return;
     }
 
     const now = new Date().toISOString();
+
+    if (editingFoodId) {
+      const currentFood = foods.find((food) => food.id === editingFoodId);
+      if (!currentFood) {
+        return;
+      }
+
+      const updatedFood = {
+        ...currentFood,
+        name: trimmedName,
+        brand: draft.brand.trim(),
+        defaultServingLabel: draft.defaultServingLabel.trim(),
+        calories: Number(draft.calories || 0),
+        protein: Number(draft.protein || 0),
+        carbs: Number(draft.carbs || 0),
+        fat: Number(draft.fat || 0),
+        fiber: Number(draft.fiber || 0),
+        updatedAt: now,
+      };
+
+      setFoods((current) => current.map((food) => (food.id === editingFoodId ? updatedFood : food)));
+      setEditingFoodId(null);
+      resetDraft();
+      setActiveTab("search");
+      return;
+    }
+
     const nextFood = {
       id: crypto.randomUUID(),
+      barcode: barcodeFallback || undefined,
       name: trimmedName,
       brand: draft.brand.trim(),
       defaultServingLabel: draft.defaultServingLabel.trim(),
@@ -1293,6 +1670,13 @@ export function App() {
     };
 
     setFoods((current) => [nextFood, ...current]);
+    resetDraft();
+    setBarcodeFallback("");
+    clearOcr();
+    setActiveTab("search");
+  }
+
+  function resetDraft() {
     setDraft({
       name: "",
       brand: "",
@@ -1303,6 +1687,30 @@ export function App() {
       fat: "",
       fiber: "",
     });
+  }
+
+  function startEditFood(food) {
+    setEditingFoodId(food.id);
+    setDuplicateError(false);
+    setBarcodeFallback("");
+    clearOcr();
+    setDraft({
+      name: food.name || "",
+      brand: food.brand || "",
+      defaultServingLabel: food.defaultServingLabel || "",
+      calories: food.calories ?? "",
+      protein: food.protein ?? "",
+      carbs: food.carbs ?? "",
+      fat: food.fat ?? "",
+      fiber: food.fiber ?? "",
+    });
+    setActiveTab("create");
+  }
+
+  function cancelEditFood() {
+    setEditingFoodId(null);
+    setDuplicateError(false);
+    resetDraft();
     setActiveTab("search");
   }
 
@@ -1327,7 +1735,10 @@ export function App() {
       setActiveTab("search");
       await addFood(scannedFood, selectedMeal);
     } catch (error) {
-      window.alert(error.message || "Nao foi possivel buscar esse produto. Cadastre manualmente.");
+      setBarcodeFallback(cleanBarcode);
+      setEditingFoodId(null);
+      setDraft((current) => ({ ...current, name: current.name || `Produto ${cleanBarcode}` }));
+      clearOcr();
       setActiveTab("create");
     }
   }
@@ -1352,6 +1763,59 @@ export function App() {
 
   function editEntry(entry, food) {
     addFood(food, entry.mealType, entry.servingMultiplier, entry.id);
+  }
+
+  function exportCsv() {
+    const csv = buildBackupCsv({ foods, entries, settings });
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `hoje-kcal-backup-${todayKey()}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    setImportStatus(`Exportado: ${foods.length} alimentos e ${entries.length} lancamentos.`);
+  }
+
+  async function importCsv(event) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+
+    if (!file) {
+      return;
+    }
+
+    if (!window.confirm("Importar este CSV vai substituir alimentos, historico e metas atuais. Continuar?")) {
+      return;
+    }
+
+    try {
+      const text = await file.text();
+      const imported = parseBackupCsv(text);
+
+      await Promise.all([
+        clearStore(FOODS_STORE),
+        clearStore(ENTRIES_STORE),
+        clearStore(SETTINGS_STORE),
+      ]);
+
+      await Promise.all([
+        putMany(FOODS_STORE, imported.foods),
+        putMany(ENTRIES_STORE, imported.entries),
+        putItem(SETTINGS_STORE, { key: SEED_KEY, value: true }),
+        putItem(SETTINGS_STORE, { key: "preferences", value: imported.settings }),
+      ]);
+
+      setFoods(imported.foods);
+      setEntries(imported.entries);
+      setSettings(imported.settings);
+      setActiveTab("profile");
+      setImportStatus(`Importado: ${imported.foods.length} alimentos e ${imported.entries.length} lancamentos.`);
+    } catch (error) {
+      setImportStatus(error.message || "Nao foi possivel importar o CSV.");
+    }
   }
 
   const groupedEntries = {
@@ -1435,6 +1899,7 @@ export function App() {
             setSelectedMeal={setSelectedMeal}
             onAddFood={addFood}
             onToggleFavorite={toggleFavorite}
+            onEditFood={startEditFood}
           />
         ) : null}
 
@@ -1444,6 +1909,7 @@ export function App() {
             selectedMeal={selectedMeal}
             onAddFood={addFood}
             onToggleFavorite={toggleFavorite}
+            onEditFood={startEditFood}
           />
         ) : null}
 
@@ -1456,12 +1922,27 @@ export function App() {
             draft={draft}
             setDraft={setDraft}
             onCreateFood={createFood}
+            onCancelEditFood={cancelEditFood}
+            editingFoodId={editingFoodId}
             duplicateError={duplicateError}
+            barcodeFallback={barcodeFallback}
+            ocrState={ocrState}
+            onSelectOcrImage={selectOcrImage}
+            onRunOcr={runOcr}
+            onClearOcr={clearOcr}
+            onApplyOcr={applyCurrentOcr}
           />
         ) : null}
 
         {activeTab === "profile" ? (
-          <ProfilePanel settings={settings} setSettings={setSettings} history={history} />
+          <ProfilePanel
+            settings={settings}
+            setSettings={setSettings}
+            history={history}
+            importStatus={importStatus}
+            onExportCsv={exportCsv}
+            onImportCsv={importCsv}
+          />
         ) : null}
 
         <nav className="bottom-nav">
