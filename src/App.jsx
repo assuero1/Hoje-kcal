@@ -160,14 +160,129 @@ function numberFromOcr(value) {
   return match[0].replace(",", ".");
 }
 
-function extractLineValue(text, labels) {
-  const lines = String(text || "").split(/\n+/);
+function extractOcrNumbers(value) {
+  return Array.from(String(value || "").matchAll(/\d+(?:[,.]\d+)?/g)).map((match) => ({
+    raw: match[0],
+    value: Number(match[0].replace(",", ".")),
+    index: match.index || 0,
+  })).filter((item) => Number.isFinite(item.value));
+}
+
+function normalizedServingUnit(unit) {
+  return String(unit || "")
+    .toLowerCase()
+    .replace("gramas", "g")
+    .replace("mililitros", "ml")
+    .replace(/unidades?|unid\.?/, "unidade");
+}
+
+function nutritionLabelLines(text) {
+  return String(text || "")
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function extractServingFromLine(line) {
+  const servingMatch = String(line || "").match(/(\d+(?:[,.]\d+)?)\s*(g|gramas|ml|mililitros|unidades?|unid\.?|fatias?)/i);
+  if (!servingMatch) {
+    return null;
+  }
+
+  return {
+    amount: Number(servingMatch[1].replace(",", ".")),
+    unit: normalizedServingUnit(servingMatch[2]),
+    raw: `${servingMatch[1].replace(",", ".")} ${normalizedServingUnit(servingMatch[2])}`,
+  };
+}
+
+function extractQuantityColumns(text) {
+  const columns = [];
+  const ignoredNormalizedLines = ["porcoes por embalagem", "porcoes", "percentual", "valores diarios"];
+
+  nutritionLabelLines(text).forEach((line) => {
+    const normalizedLine = normalizeText(line);
+    if (ignoredNormalizedLines.some((ignored) => normalizedLine.includes(ignored))) {
+      return;
+    }
+
+    Array.from(line.matchAll(/(\d+(?:[,.]\d+)?)\s*(g|gramas|ml|mililitros)(?![a-z])/gi)).forEach((match) => {
+      const amount = Number(match[1].replace(",", "."));
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return;
+      }
+
+      columns.push({
+        amount,
+        unit: normalizedServingUnit(match[2]),
+        label: `${match[1].replace(",", ".")} ${normalizedServingUnit(match[2])}`,
+        line,
+        index: match.index || 0,
+      });
+    });
+  });
+
+  const uniqueColumns = columns.filter((column, index, list) =>
+    list.findIndex((item) => item.amount === column.amount && item.unit === column.unit) === index
+  );
+
+  return uniqueColumns.sort((left, right) => left.index - right.index);
+}
+
+function getBaseServingColumn(text) {
+  const servingLine = nutritionLabelLines(text).find((line) => {
+    const normalized = normalizeText(line);
+    return normalized.includes("porcao") || normalized.includes("serving");
+  });
+  const serving = extractServingFromLine(servingLine);
+  const columns = extractQuantityColumns(text);
+
+  if (columns.length) {
+    const smallerColumn = columns.reduce((selected, column) => {
+      if (!selected) {
+        return column;
+      }
+
+      return column.amount < selected.amount ? column : selected;
+    }, null);
+    const columnIndex = columns.findIndex((column) => column === smallerColumn);
+
+    return {
+      serving: smallerColumn,
+      columnIndex: Math.max(0, columnIndex),
+      columns,
+    };
+  }
+
+  if (serving) {
+    return { serving, columnIndex: 0, columns: [serving] };
+  }
+
+  return { serving: { amount: 100, unit: "g", raw: "100 g" }, columnIndex: 0, columns: [] };
+}
+
+function valueFromNutritionLine(line, columnIndex) {
+  const numbers = extractOcrNumbers(line);
+  if (!numbers.length) {
+    return "";
+  }
+
+  const hasDailyValueColumn = /%\s*v\s*d|vd\*?|daily value/i.test(line) || numbers.length >= 3;
+  const nutrientColumnCount = hasDailyValueColumn ? numbers.length - 1 : numbers.length;
+  const boundedColumnIndex = Math.min(Math.max(columnIndex, 0), Math.max(nutrientColumnCount - 1, 0));
+  const selectedNumber = numbers[boundedColumnIndex] || numbers[numbers.length - 1];
+
+  return selectedNumber.raw.replace(",", ".");
+}
+
+function extractLineValue(text, labels, columnIndex = 0) {
+  const lines = nutritionLabelLines(text);
   const normalizedLabels = labels.map(normalizeText);
 
   for (const line of lines) {
     const normalizedLine = normalizeText(line);
     if (normalizedLabels.some((label) => normalizedLine.includes(label))) {
-      const value = numberFromOcr(line);
+      const value = valueFromNutritionLine(line, columnIndex);
       if (value !== "") {
         return value;
       }
@@ -178,51 +293,25 @@ function extractLineValue(text, labels) {
 }
 
 function extractServingLabel(text) {
-  const lines = String(text || "").split(/\n+/);
-  const servingLine = lines.find((line) => {
-    const normalized = normalizeText(line);
-    return normalized.includes("porcao") || normalized.includes("serving") || normalized.includes("porcao de");
-  });
-
-  if (!servingLine) {
-    return "100 g";
-  }
-
-  const servingMatch = servingLine.match(/(\d+(?:[,.]\d+)?)\s*(g|gramas|ml|mililitros|unidades?|unid\.?|fatias?)/i);
-  if (!servingMatch) {
-    return servingLine.trim().slice(0, 40) || "100 g";
-  }
-
-  return `${servingMatch[1].replace(",", ".")} ${servingMatch[2].toLowerCase().replace("gramas", "g").replace("mililitros", "ml")}`;
-}
-
-function extractProductName(text) {
-  const ignored = ["informacao nutricional", "informacoes nutricionais", "tabela nutricional", "nutrition facts"];
-  const lines = String(text || "")
-    .split(/\n+/)
-    .map((line) => line.trim())
-    .filter((line) => line.length >= 4 && !/\d/.test(line));
-
-  const candidate = lines.find((line) => !ignored.some((item) => normalizeText(line).includes(item)));
-  return candidate ? candidate.slice(0, 48) : "";
+  return getBaseServingColumn(text).serving.raw || "100 g";
 }
 
 function parseNutritionOcrText(text) {
-  return {
-    name: extractProductName(text),
+  const { columnIndex } = getBaseServingColumn(text);
+  const parsed = {
     defaultServingLabel: extractServingLabel(text),
-    calories: extractLineValue(text, ["valor energetico", "calorias", "kcal", "energy"]),
-    protein: extractLineValue(text, ["proteina", "proteinas", "protein"]),
-    carbs: extractLineValue(text, ["carboidrato", "carboidratos", "carbohydrate", "carbohydrates"]),
-    fat: extractLineValue(text, ["gorduras totais", "gordura total", "total fat", "fat"]),
-    fiber: extractLineValue(text, ["fibra alimentar", "fibra", "fiber"]),
+    calories: extractLineValue(text, ["valor energetico", "calorias", "kcal", "energy"], columnIndex),
+    protein: extractLineValue(text, ["proteina", "proteinas", "protein"], columnIndex),
+    carbs: extractLineValue(text, ["carboidrato", "carboidratos", "carbohydrate", "carbohydrates"], columnIndex),
+    fat: extractLineValue(text, ["gorduras totais", "gordura total", "total fat", "fat"], columnIndex),
+    fiber: extractLineValue(text, ["fibra alimentar", "fibras alimentares", "fibra", "fiber"], columnIndex),
   };
+
+  return parsed;
 }
 
 function mergeOcrDraft(current, parsed) {
-  return Object.fromEntries(
-    Object.entries(parsed).map(([key, value]) => [key, current[key] || value]),
-  );
+  return Object.fromEntries(Object.entries(parsed).map(([key, value]) => [key, value || current[key]]));
 }
 
 function openDb() {
