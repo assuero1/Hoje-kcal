@@ -434,6 +434,54 @@ function parseLocalizedNumber(value) {
   return Number.isFinite(parsedValue) ? parsedValue : 0;
 }
 
+function speechRecognitionConstructor() {
+  return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+}
+
+function speechNumberToken(value) {
+  const tokens = {
+    zero: "0",
+    um: "1",
+    uma: "1",
+    dois: "2",
+    duas: "2",
+    tres: "3",
+    três: "3",
+    quatro: "4",
+    cinco: "5",
+    seis: "6",
+    sete: "7",
+    oito: "8",
+    nove: "9",
+    dez: "10",
+  };
+
+  return tokens[normalizeText(value)] || "";
+}
+
+function numberFromSpeech(value) {
+  const spoken = String(value || "").trim().toLowerCase();
+  const numericMatch = spoken.match(/\d+(?:[,.]\d+)?/);
+
+  if (numericMatch) {
+    return numericMatch[0].replace(".", ",");
+  }
+
+  const parts = spoken.split(/\s+/);
+  const decimalIndex = parts.findIndex((part) => ["virgula", "vírgula", "ponto"].includes(part));
+
+  if (decimalIndex >= 0) {
+    const integerToken = speechNumberToken(parts[decimalIndex - 1]) || "0";
+    const decimalTokens = parts.slice(decimalIndex + 1).map(speechNumberToken).filter(Boolean);
+
+    if (decimalTokens.length) {
+      return `${integerToken},${decimalTokens.join("")}`;
+    }
+  }
+
+  return speechNumberToken(parts[0]) || spoken;
+}
+
 function startOfDayOffset(offset) {
   const now = new Date();
   now.setDate(now.getDate() - offset);
@@ -1002,7 +1050,26 @@ function CreatePanel({
   onRunOcr,
   onClearOcr,
   onApplyOcr,
+  speechState,
+  onStartSpeech,
 }) {
+  const isListening = (field) => speechState.field === field && speechState.status === "listening";
+  const speechSupported = speechState.supported;
+
+  function voiceButton(field, mode = "text") {
+    return (
+      <button
+        className={`voice-button ${isListening(field) ? "listening" : ""}`}
+        type="button"
+        onClick={() => onStartSpeech(field, mode)}
+        disabled={!speechSupported || speechState.status === "listening"}
+        aria-label={`Falar ${field}`}
+      >
+        {isListening(field) ? "ouvindo" : "falar"}
+      </button>
+    );
+  }
+
   return (
     <section className="tab-panel">
       <div className="section-head">
@@ -1069,83 +1136,116 @@ function CreatePanel({
           ) : null}
         </div> : null}
 
+        <div className="voice-card">
+          <div>
+            <p className="section-kicker">STT nativo</p>
+            <strong>Preencha falando</strong>
+          </div>
+          <span>{speechSupported ? "microfone" : "indisponivel"}</span>
+          {speechState.error ? <p>{speechState.error}</p> : null}
+        </div>
+
         <label>
           Nome
-          <input
-            value={draft.name}
-            onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))}
-            placeholder="Ex.: Pao integral"
-          />
+          <div className="input-with-voice">
+            <input
+              value={draft.name}
+              onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))}
+              placeholder="Ex.: Pao integral"
+            />
+            {voiceButton("name")}
+          </div>
         </label>
         <label>
           Marca
-          <input
-            value={draft.brand}
-            onChange={(event) => setDraft((current) => ({ ...current, brand: event.target.value }))}
-            placeholder="Opcional"
-          />
+          <div className="input-with-voice">
+            <input
+              value={draft.brand}
+              onChange={(event) => setDraft((current) => ({ ...current, brand: event.target.value }))}
+              placeholder="Opcional"
+            />
+            {voiceButton("brand")}
+          </div>
         </label>
         <label>
           Porcao base
-          <input
-            value={draft.defaultServingLabel}
-            onChange={(event) =>
-              setDraft((current) => ({ ...current, defaultServingLabel: event.target.value }))
-            }
-            placeholder="Ex.: 1 fatia"
-          />
+          <div className="input-with-voice">
+            <input
+              value={draft.defaultServingLabel}
+              onChange={(event) =>
+                setDraft((current) => ({ ...current, defaultServingLabel: event.target.value }))
+              }
+              placeholder="Ex.: 1 fatia"
+            />
+            {voiceButton("defaultServingLabel")}
+          </div>
         </label>
 
         <div className="form-grid">
           <label>
             Calorias
-            <input
-              type="text"
-              inputMode="decimal"
-              pattern="[0-9]*[,.]?[0-9]*"
-              value={draft.calories}
-              onChange={(event) => setDraft((current) => ({ ...current, calories: event.target.value }))}
-            />
+            <div className="input-with-voice compact">
+              <input
+                type="text"
+                inputMode="decimal"
+                pattern="[0-9]*[,.]?[0-9]*"
+                value={draft.calories}
+                onChange={(event) => setDraft((current) => ({ ...current, calories: event.target.value }))}
+              />
+              {voiceButton("calories", "number")}
+            </div>
           </label>
           <label>
             Proteina
-            <input
-              type="text"
-              inputMode="decimal"
-              pattern="[0-9]*[,.]?[0-9]*"
-              value={draft.protein}
-              onChange={(event) => setDraft((current) => ({ ...current, protein: event.target.value }))}
-            />
+            <div className="input-with-voice compact">
+              <input
+                type="text"
+                inputMode="decimal"
+                pattern="[0-9]*[,.]?[0-9]*"
+                value={draft.protein}
+                onChange={(event) => setDraft((current) => ({ ...current, protein: event.target.value }))}
+              />
+              {voiceButton("protein", "number")}
+            </div>
           </label>
           <label>
             Carbo
-            <input
-              type="text"
-              inputMode="decimal"
-              pattern="[0-9]*[,.]?[0-9]*"
-              value={draft.carbs}
-              onChange={(event) => setDraft((current) => ({ ...current, carbs: event.target.value }))}
-            />
+            <div className="input-with-voice compact">
+              <input
+                type="text"
+                inputMode="decimal"
+                pattern="[0-9]*[,.]?[0-9]*"
+                value={draft.carbs}
+                onChange={(event) => setDraft((current) => ({ ...current, carbs: event.target.value }))}
+              />
+              {voiceButton("carbs", "number")}
+            </div>
           </label>
           <label>
             Gordura
-            <input
-              type="text"
-              inputMode="decimal"
-              pattern="[0-9]*[,.]?[0-9]*"
-              value={draft.fat}
-              onChange={(event) => setDraft((current) => ({ ...current, fat: event.target.value }))}
-            />
+            <div className="input-with-voice compact">
+              <input
+                type="text"
+                inputMode="decimal"
+                pattern="[0-9]*[,.]?[0-9]*"
+                value={draft.fat}
+                onChange={(event) => setDraft((current) => ({ ...current, fat: event.target.value }))}
+              />
+              {voiceButton("fat", "number")}
+            </div>
           </label>
           <label>
             Fibra
-            <input
-              type="text"
-              inputMode="decimal"
-              pattern="[0-9]*[,.]?[0-9]*"
-              value={draft.fiber}
-              onChange={(event) => setDraft((current) => ({ ...current, fiber: event.target.value }))}
-            />
+            <div className="input-with-voice compact">
+              <input
+                type="text"
+                inputMode="decimal"
+                pattern="[0-9]*[,.]?[0-9]*"
+                value={draft.fiber}
+                onChange={(event) => setDraft((current) => ({ ...current, fiber: event.target.value }))}
+              />
+              {voiceButton("fiber", "number")}
+            </div>
           </label>
         </div>
 
@@ -1443,6 +1543,12 @@ export function App() {
     status: "idle",
     error: "",
   });
+  const [speechState, setSpeechState] = useState({
+    supported: Boolean(speechRecognitionConstructor()),
+    field: "",
+    status: "idle",
+    error: "",
+  });
   const [draft, setDraft] = useState({
     name: "",
     brand: "",
@@ -1616,6 +1722,59 @@ export function App() {
     if (ocrState.text) {
       applyOcrText(ocrState.text);
     }
+  }
+
+  function startSpeechInput(field, mode = "text") {
+    const SpeechRecognition = speechRecognitionConstructor();
+
+    if (!SpeechRecognition) {
+      setSpeechState({
+        supported: false,
+        field: "",
+        status: "idle",
+        error: "Reconhecimento de voz indisponivel neste navegador.",
+      });
+      return;
+    }
+
+    const recognition = new SpeechRecognition();
+    recognition.lang = "pt-BR";
+    recognition.interimResults = false;
+    recognition.maxAlternatives = 1;
+
+    recognition.onstart = () => {
+      setSpeechState({ supported: true, field, status: "listening", error: "" });
+    };
+
+    recognition.onresult = (event) => {
+      const transcript = event.results?.[0]?.[0]?.transcript || "";
+      const value = mode === "number" ? numberFromSpeech(transcript) : transcript.trim();
+
+      if (value) {
+        setDraft((current) => ({ ...current, [field]: value }));
+      }
+    };
+
+    recognition.onerror = (event) => {
+      setSpeechState({
+        supported: true,
+        field: "",
+        status: "idle",
+        error: event.error === "not-allowed"
+          ? "Permita o acesso ao microfone para preencher falando."
+          : "Nao foi possivel ouvir. Tente falar novamente.",
+      });
+    };
+
+    recognition.onend = () => {
+      setSpeechState((current) => ({
+        ...current,
+        field: "",
+        status: "idle",
+      }));
+    };
+
+    recognition.start();
   }
 
   function createFood() {
@@ -1940,6 +2099,8 @@ export function App() {
             onRunOcr={runOcr}
             onClearOcr={clearOcr}
             onApplyOcr={applyCurrentOcr}
+            speechState={speechState}
+            onStartSpeech={startSpeechInput}
           />
         ) : null}
 
