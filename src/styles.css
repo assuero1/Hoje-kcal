@@ -39,7 +39,8 @@ body {
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
@@ -50,13 +51,20 @@ button {
 }
 
 input,
-select {
+select,
+textarea {
   width: 100%;
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 14px;
   background: rgba(255, 255, 255, 0.04);
   color: var(--text);
   padding: 14px 16px;
+}
+
+textarea {
+  resize: vertical;
+  min-height: 92px;
+  line-height: 1.45;
 }
 
 select {
@@ -660,7 +668,8 @@ select {
 .food-list li,
 .settings-card,
 .history-card,
-.backup-card {
+.backup-card,
+.ai-card {
   border-radius: 20px;
   border: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.03);
@@ -701,7 +710,8 @@ select {
 }
 
 .food-form,
-.settings-card {
+.settings-card,
+.ai-card {
   display: flex;
   flex-direction: column;
   gap: 14px;
@@ -709,6 +719,7 @@ select {
 
 .food-form label,
 .settings-card label,
+.ai-card label,
 .meal-select {
   display: flex;
   flex-direction: column;
@@ -887,6 +898,10 @@ select {
   gap: 8px;
 }
 
+.ocr-actions.two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .ocr-actions button {
   border-radius: 14px;
   border: 1px solid var(--line);
@@ -993,6 +1008,116 @@ select {
   font-size: 0.82rem;
   text-transform: uppercase;
   letter-spacing: 0.05em;
+}
+
+.ai-card {
+  border-color: rgba(215, 255, 22, 0.18);
+  background:
+    radial-gradient(circle at top right, rgba(215, 255, 22, 0.07), transparent 44%),
+    rgba(255, 255, 255, 0.03);
+}
+
+.ai-card h3 {
+  margin: 4px 0 0;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.ai-card .ocr-card-head span {
+  border-radius: 999px;
+  background: rgba(215, 255, 22, 0.1);
+  color: var(--accent);
+  padding: 6px 10px;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.ai-muted,
+.ai-note p,
+.ai-message p {
+  margin: 0;
+  color: rgba(247, 243, 232, 0.76);
+  line-height: 1.5;
+}
+
+.ai-note {
+  border-radius: 16px;
+  border: 1px solid rgba(215, 255, 22, 0.24);
+  background: rgba(215, 255, 22, 0.06);
+  padding: 14px;
+}
+
+.ai-note strong,
+.ai-message strong {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 0.82rem;
+}
+
+.ai-note small {
+  display: block;
+  margin-top: 8px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 0.74rem;
+}
+
+.ai-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.ai-suggestions button {
+  border-radius: 999px;
+  border: 1px solid rgba(215, 255, 22, 0.26);
+  background: rgba(215, 255, 22, 0.07);
+  color: var(--accent);
+  padding: 9px 11px;
+  font-size: 0.76rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.ai-suggestions button:disabled,
+.primary-cta:disabled {
+  opacity: 0.48;
+}
+
+.ai-chat-log {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 360px;
+  overflow: auto;
+}
+
+.ai-message {
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background: rgba(0, 0, 0, 0.14);
+  padding: 13px;
+}
+
+.ai-message.user {
+  margin-left: 24px;
+  border-color: rgba(255, 255, 255, 0.13);
+}
+
+.ai-message.user strong {
+  color: var(--sand);
+}
+
+.ai-message.assistant {
+  margin-right: 24px;
+  border-color: rgba(215, 255, 22, 0.2);
+  background: rgba(215, 255, 22, 0.045);
 }
 
 .history-grid {

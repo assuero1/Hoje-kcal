@@ -30,6 +30,11 @@ const defaultSettings = {
     fat: 80,
     fiber: 30,
   },
+  ai: {
+    provider: "google-gemini",
+    model: "gemini-flash-latest",
+    apiKey: "",
+  },
   locale: "pt-BR",
   units: "metric",
 };
@@ -314,6 +319,21 @@ function mergeOcrDraft(current, parsed) {
   return Object.fromEntries(Object.entries(parsed).map(([key, value]) => [key, value || current[key]]));
 }
 
+function mergeSettings(settings) {
+  return {
+    ...defaultSettings,
+    ...settings,
+    macroTargets: {
+      ...defaultSettings.macroTargets,
+      ...(settings?.macroTargets || {}),
+    },
+    ai: {
+      ...defaultSettings.ai,
+      ...(settings?.ai || {}),
+    },
+  };
+}
+
 function openDb() {
   return new Promise((resolve, reject) => {
     const request = window.indexedDB.open(STORAGE_DB_NAME, STORAGE_VERSION);
@@ -467,7 +487,7 @@ function buildBackupCsv(data) {
 
 function parseBackupCsv(text) {
   const rows = parseCsv(text);
-  const next = { settings: defaultSettings, foods: [], entries: [], settingsRecords: [] };
+  const next = { settings: mergeSettings(defaultSettings), foods: [], entries: [], settingsRecords: [] };
 
   rows.forEach((row) => {
     const type = row.type;
@@ -476,7 +496,7 @@ function parseBackupCsv(text) {
     if (type === "setting") {
       next.settingsRecords.push(payload);
       if (payload.key === "preferences" && payload.value) {
-        next.settings = payload.value;
+        next.settings = mergeSettings(payload.value);
       }
     }
 
@@ -521,6 +541,168 @@ function parseLocalizedNumber(value) {
     .replace(",", ".");
   const parsedValue = Number(normalizedValue || 0);
   return Number.isFinite(parsedValue) ? parsedValue : 0;
+}
+
+function jsonFromAiText(text) {
+  const cleaned = String(text || "")
+    .trim()
+    .replace(/^```(?:json)?/i, "")
+    .replace(/```$/i, "")
+    .trim();
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+
+  if (start < 0 || end < start) {
+    throw new Error("A IA nao retornou um JSON valido.");
+  }
+
+  return JSON.parse(cleaned.slice(start, end + 1));
+}
+
+function aiProviderLabel(provider) {
+  const labels = {
+    "google-gemini": "Google Gemini",
+  };
+  return labels[provider] || provider || "IA";
+}
+
+async function generateAiText(settings, prompt) {
+  const ai = mergeSettings(settings).ai;
+  const provider = ai.provider || "google-gemini";
+  const apiKey = String(ai.apiKey || "").trim();
+  const model = String(ai.model || "gemini-flash-latest").trim();
+
+  if (!apiKey) {
+    throw new Error("Preencha a chave de API da IA no Perfil antes de usar o assistente.");
+  }
+
+  if (provider !== "google-gemini") {
+    throw new Error(`Provedor ${provider} ainda nao implementado.`);
+  }
+
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-goog-api-key": apiKey,
+    },
+    body: JSON.stringify({
+      contents: [
+        {
+          parts: [{ text: prompt }],
+        },
+      ],
+    }),
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data?.error?.message || "Nao foi possivel consultar a IA.");
+  }
+
+  const text = data?.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("\n").trim();
+  if (!text) {
+    throw new Error("A IA nao retornou uma resposta.");
+  }
+
+  return text;
+}
+
+function normalizeAiFoodDraft(food) {
+  const numberValue = (value) => {
+    const parsed = Number(String(value ?? "").replace(",", "."));
+    return Number.isFinite(parsed) ? String(parsed).replace(".", ",") : "";
+  };
+
+  return {
+    name: String(food?.name || ""),
+    brand: String(food?.brand || ""),
+    defaultServingLabel: String(food?.defaultServingLabel || food?.servingLabel || ""),
+    calories: numberValue(food?.calories),
+    protein: numberValue(food?.protein),
+    carbs: numberValue(food?.carbs),
+    fat: numberValue(food?.fat),
+    fiber: numberValue(food?.fiber),
+  };
+}
+
+function buildFoodAiPrompt(description) {
+  return `Voce e um assistente de cadastro de alimentos para um diario alimentar em portugues do Brasil.
+Extraia ou estime os atributos nutricionais do alimento descrito pelo usuario.
+Responda APENAS com JSON valido, sem markdown, no formato:
+{
+  "name": "Nome do alimento ou preparacao",
+  "brand": "Marca quando informada ou vazio",
+  "defaultServingLabel": "Porcao base, ex.: 100 g, 1 unidade, 1 prato",
+  "defaultServingGrams": 100,
+  "calories": 0,
+  "protein": 0,
+  "carbs": 0,
+  "fat": 0,
+  "fiber": 0,
+  "confidence": "low|medium|high",
+  "notes": "curta observacao sobre estimativas"
+}
+Use numeros por porcao base. Se algo for incerto, estime com prudencia e marque confidence baixo ou medio.
+
+Descricao do usuario: ${description}`;
+}
+
+function buildProfileAiContext({ settings, entries, foods, totals, history }) {
+  const today = todayKey();
+  const last30Keys = new Set(Array.from({ length: 30 }).map((_, index) => startOfDayOffset(index)));
+  const recentEntries = entries.filter((entry) => last30Keys.has(entry.date));
+  const byDate = Array.from(last30Keys).sort().map((date) => {
+    const dayEntries = recentEntries.filter((entry) => entry.date === date);
+    return {
+      date,
+      entries: dayEntries.length,
+      totals: sumNutrition(dayEntries),
+    };
+  });
+  const foodCounts = recentEntries.reduce((acc, entry) => {
+    const name = entry.foodNameSnapshot || foods.find((food) => food.id === entry.foodItemId)?.name || "Alimento";
+    acc[name] = (acc[name] || 0) + 1;
+    return acc;
+  }, {});
+  const mealPatterns = Object.keys(mealLabels).map((mealType) => {
+    const mealEntries = recentEntries.filter((entry) => entry.mealType === mealType);
+    const trackedDays = new Set(mealEntries.map((entry) => entry.date)).size || 1;
+    return {
+      mealType,
+      label: mealLabels[mealType],
+      entries: mealEntries.length,
+      averageCaloriesWhenTracked: Math.round(sumNutrition(mealEntries).calories / trackedDays),
+    };
+  });
+
+  return {
+    period: "ultimos 30 dias",
+    today,
+    profile: {
+      dailyCalorieGoal: settings.dailyCalorieGoal,
+      macroTargets: settings.macroTargets,
+    },
+    todayTotals: totals,
+    recentHistory: history,
+    dailyTotals: byDate,
+    topFoods: Object.entries(foodCounts)
+      .map(([name, count]) => ({ name, count }))
+      .sort((left, right) => right.count - left.count)
+      .slice(0, 10),
+    mealPatterns,
+  };
+}
+
+function buildProfileAiPrompt(context, question) {
+  return `Voce e um assistente analitico de diario alimentar. Responda em portugues do Brasil, com tom direto e pratico.
+Use somente os dados fornecidos no JSON de contexto. Se nao houver dado suficiente, diga isso claramente.
+Nao faca diagnosticos medicos, prescricoes clinicas ou promessas de saude. Foque em padroes alimentares, metas, calorias e macros.
+
+Contexto do app:
+${JSON.stringify(context, null, 2)}
+
+Pergunta do usuario: ${question}`;
 }
 
 function speechRecognitionConstructor() {
@@ -1129,6 +1311,8 @@ function FavoritesPanel({ foods, onAddFood, onToggleFavorite, onEditFood, select
 function CreatePanel({
   draft,
   setDraft,
+  aiSettings,
+  onFillFoodWithAi,
   onCreateFood,
   onCancelEditFood,
   editingFoodId,
@@ -1142,8 +1326,30 @@ function CreatePanel({
   speechState,
   onStartSpeech,
 }) {
+  const [aiDescription, setAiDescription] = useState("");
+  const [aiFoodState, setAiFoodState] = useState({ status: "idle", error: "", notes: "", confidence: "" });
   const isListening = (field) => speechState.field === field && speechState.status === "listening";
   const speechSupported = speechState.supported;
+
+  async function fillWithAi() {
+    if (!aiDescription.trim()) {
+      setAiFoodState({ status: "error", error: "Descreva o alimento antes de chamar a IA.", notes: "", confidence: "" });
+      return;
+    }
+
+    setAiFoodState({ status: "loading", error: "", notes: "", confidence: "" });
+    try {
+      const result = await onFillFoodWithAi(aiDescription);
+      setAiFoodState({
+        status: "done",
+        error: "",
+        notes: result.notes || "Revise os campos antes de salvar.",
+        confidence: result.confidence || "",
+      });
+    } catch (error) {
+      setAiFoodState({ status: "error", error: error.message || "Nao foi possivel preencher com IA.", notes: "", confidence: "" });
+    }
+  }
 
   function voiceButton(field, mode = "text") {
     return (
@@ -1224,6 +1430,43 @@ function CreatePanel({
             </details>
           ) : null}
         </div> : null}
+
+        {!editingFoodId ? (
+          <div className="ai-card">
+            <div className="ocr-card-head">
+              <div>
+                <p className="section-kicker">IA generativa</p>
+                <h3>Preencher por descricao</h3>
+              </div>
+              <span>{aiProviderLabel(aiSettings?.provider)}</span>
+            </div>
+            <label>
+              Descreva o alimento
+              <textarea
+                value={aiDescription}
+                onChange={(event) => setAiDescription(event.target.value)}
+                placeholder="Ex.: 1 iogurte natural de 170g com 1 banana prata e 20g de aveia"
+                rows={4}
+              />
+            </label>
+            <div className="ocr-actions two">
+              <button type="button" onClick={fillWithAi} disabled={aiFoodState.status === "loading"}>
+                {aiFoodState.status === "loading" ? "Analisando..." : "Preencher com IA"}
+              </button>
+              <button type="button" onClick={() => setAiDescription("")} disabled={aiFoodState.status === "loading"}>
+                Limpar descricao
+              </button>
+            </div>
+            {aiFoodState.error ? <div className="form-alert">{aiFoodState.error}</div> : null}
+            {aiFoodState.status === "done" ? (
+              <div className="ai-note">
+                <strong>Campos preenchidos pela IA</strong>
+                <p>{aiFoodState.notes}</p>
+                {aiFoodState.confidence ? <small>Confianca: {aiFoodState.confidence}</small> : null}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
 
         <div className="voice-card">
           <div>
@@ -1349,7 +1592,48 @@ function CreatePanel({
   );
 }
 
-function ProfilePanel({ settings, setSettings, history, importStatus, onExportCsv, onImportCsv }) {
+function ProfilePanel({
+  settings,
+  setSettings,
+  history,
+  importStatus,
+  onExportCsv,
+  onImportCsv,
+  onAskProfileAi,
+}) {
+  const [profileQuestion, setProfileQuestion] = useState("");
+  const [profileAiState, setProfileAiState] = useState({ status: "idle", error: "" });
+  const [profileMessages, setProfileMessages] = useState([]);
+
+  async function askProfileAi(question = profileQuestion) {
+    const trimmedQuestion = question.trim();
+    if (!trimmedQuestion) {
+      setProfileAiState({ status: "error", error: "Digite uma pergunta para a IA." });
+      return;
+    }
+
+    setProfileAiState({ status: "loading", error: "" });
+    setProfileMessages((current) => [...current, { role: "user", text: trimmedQuestion }]);
+    setProfileQuestion("");
+    try {
+      const answer = await onAskProfileAi(trimmedQuestion);
+      setProfileMessages((current) => [...current, { role: "assistant", text: answer }]);
+      setProfileAiState({ status: "idle", error: "" });
+    } catch (error) {
+      setProfileAiState({ status: "error", error: error.message || "Nao foi possivel consultar a IA." });
+    }
+  }
+
+  function updateAiSettings(field, value) {
+    setSettings((current) => ({
+      ...current,
+      ai: {
+        ...mergeSettings(current).ai,
+        [field]: value,
+      },
+    }));
+  }
+
   return (
     <section className="tab-panel">
       <div className="section-head">
@@ -1477,6 +1761,89 @@ function ProfilePanel({ settings, setSettings, history, importStatus, onExportCs
           </label>
         </div>
         {importStatus ? <div className="backup-status">{importStatus}</div> : null}
+      </div>
+
+      <div className="ai-card">
+        <div className="section-head compact">
+          <div>
+            <p className="section-kicker">Credenciais de IA</p>
+            <h2>Provedor e chave</h2>
+          </div>
+        </div>
+        <p className="ai-muted">
+          A chave fica salva somente neste navegador junto com suas configuracoes locais.
+        </p>
+        <div className="form-grid">
+          <label>
+            Provedor
+            <select value={settings.ai?.provider || "google-gemini"} onChange={(event) => updateAiSettings("provider", event.target.value)}>
+              <option value="google-gemini">Google Gemini</option>
+            </select>
+          </label>
+          <label>
+            Modelo
+            <input
+              value={settings.ai?.model || "gemini-flash-latest"}
+              onChange={(event) => updateAiSettings("model", event.target.value)}
+              placeholder="gemini-flash-latest"
+            />
+          </label>
+        </div>
+        <label>
+          Chave de API
+          <input
+            type="password"
+            value={settings.ai?.apiKey || ""}
+            onChange={(event) => updateAiSettings("apiKey", event.target.value)}
+            placeholder="Cole sua X-goog-api-key aqui"
+          />
+        </label>
+      </div>
+
+      <div className="ai-card">
+        <div className="section-head compact">
+          <div>
+            <p className="section-kicker">Assistente IA</p>
+            <h2>Converse sobre seu historico</h2>
+          </div>
+        </div>
+        <div className="ai-suggestions">
+          {[
+            "Resuma minha semana",
+            "Estou batendo minha meta de proteina?",
+            "Qual refeicao mais pesa nas calorias?",
+          ].map((suggestion) => (
+            <button key={suggestion} type="button" onClick={() => askProfileAi(suggestion)} disabled={profileAiState.status === "loading"}>
+              {suggestion}
+            </button>
+          ))}
+        </div>
+        <div className="ai-chat-log">
+          {profileMessages.length ? profileMessages.map((message, index) => (
+            <div key={`${message.role}-${index}`} className={`ai-message ${message.role}`}>
+              <strong>{message.role === "user" ? "Voce" : "IA"}</strong>
+              <p>{message.text}</p>
+            </div>
+          )) : (
+            <div className="ai-note">
+              <strong>Pergunte sobre metas, macros e historico</strong>
+              <p>A IA usa um resumo dos ultimos 30 dias, metas atuais e totais do dia.</p>
+            </div>
+          )}
+        </div>
+        <label>
+          Sua pergunta
+          <textarea
+            value={profileQuestion}
+            onChange={(event) => setProfileQuestion(event.target.value)}
+            placeholder="Ex.: O que eu poderia ajustar para chegar mais perto da meta?"
+            rows={3}
+          />
+        </label>
+        <button className="primary-cta" type="button" onClick={() => askProfileAi()} disabled={profileAiState.status === "loading"}>
+          {profileAiState.status === "loading" ? "Consultando IA..." : "Perguntar para IA"}
+        </button>
+        {profileAiState.error ? <div className="form-alert">{profileAiState.error}</div> : null}
       </div>
     </section>
   );
@@ -1663,17 +2030,17 @@ export function App() {
       if (!seeded) {
         await putMany(FOODS_STORE, seedFoods);
         await putItem(SETTINGS_STORE, { key: SEED_KEY, value: true });
-        await putItem(SETTINGS_STORE, { key: "preferences", value: defaultSettings });
+        await putItem(SETTINGS_STORE, { key: "preferences", value: mergeSettings(defaultSettings) });
         setFoods(seedFoods);
         setEntries([]);
-        setSettings(defaultSettings);
+        setSettings(mergeSettings(defaultSettings));
         return;
       }
 
       setFoods(foodData);
       setEntries(entryData);
       if (savedSettings?.value) {
-        setSettings(savedSettings.value);
+        setSettings(mergeSettings(savedSettings.value));
       }
     }
 
@@ -1761,6 +2128,22 @@ export function App() {
   function applyOcrText(text) {
     const parsed = parseNutritionOcrText(text);
     setDraft((current) => ({ ...current, ...mergeOcrDraft(current, parsed) }));
+  }
+
+  async function fillFoodWithAi(description) {
+    const text = await generateAiText(settings, buildFoodAiPrompt(description));
+    const parsed = jsonFromAiText(text);
+    const aiDraft = normalizeAiFoodDraft(parsed);
+    setDraft((current) => ({
+      ...current,
+      ...Object.fromEntries(Object.entries(aiDraft).map(([key, value]) => [key, value || current[key]])),
+    }));
+    return parsed;
+  }
+
+  async function askProfileAi(question) {
+    const context = buildProfileAiContext({ settings, entries, foods, totals, history });
+    return generateAiText(settings, buildProfileAiPrompt(context, question));
   }
 
   function selectOcrImage(event) {
@@ -2178,6 +2561,8 @@ export function App() {
           <CreatePanel
             draft={draft}
             setDraft={setDraft}
+            aiSettings={settings.ai}
+            onFillFoodWithAi={fillFoodWithAi}
             onCreateFood={createFood}
             onCancelEditFood={cancelEditFood}
             editingFoodId={editingFoodId}
@@ -2201,6 +2586,7 @@ export function App() {
             importStatus={importStatus}
             onExportCsv={exportCsv}
             onImportCsv={importCsv}
+            onAskProfileAi={askProfileAi}
           />
         ) : null}
 
