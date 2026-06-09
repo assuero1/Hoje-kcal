@@ -2,9 +2,10 @@ import { useEffect, useMemo, useState } from "react";
 import Tesseract from "tesseract.js";
 
 const STORAGE_DB_NAME = "hoje-kcal-db";
-const STORAGE_VERSION = 1;
+const STORAGE_VERSION = 2;
 const SETTINGS_STORE = "settings";
 const FOODS_STORE = "foods";
+const RECIPES_STORE = "recipes";
 const ENTRIES_STORE = "entries";
 const SEED_KEY = "seeded";
 
@@ -349,6 +350,10 @@ function openDb() {
         db.createObjectStore(FOODS_STORE, { keyPath: "id" });
       }
 
+      if (!db.objectStoreNames.contains(RECIPES_STORE)) {
+        db.createObjectStore(RECIPES_STORE, { keyPath: "id" });
+      }
+
       if (!db.objectStoreNames.contains(ENTRIES_STORE)) {
         db.createObjectStore(ENTRIES_STORE, { keyPath: "id" });
       }
@@ -467,13 +472,14 @@ function parseCsv(text) {
   });
 }
 
-function backupRows({ foods, entries, settings }) {
+function backupRows({ foods, recipes, entries, settings }) {
   const preferences = { key: "preferences", value: settings };
   const seeded = { key: SEED_KEY, value: true };
 
   return [
     ...[preferences, seeded].map((item) => ({ type: "setting", payload: JSON.stringify(item) })),
     ...foods.map((food) => ({ type: "food", payload: JSON.stringify(food) })),
+    ...(recipes || []).map((recipe) => ({ type: "recipe", payload: JSON.stringify(recipe) })),
     ...entries.map((entry) => ({ type: "entry", payload: JSON.stringify(entry) })),
   ];
 }
@@ -487,7 +493,7 @@ function buildBackupCsv(data) {
 
 function parseBackupCsv(text) {
   const rows = parseCsv(text);
-  const next = { settings: mergeSettings(defaultSettings), foods: [], entries: [], settingsRecords: [] };
+  const next = { settings: mergeSettings(defaultSettings), foods: [], recipes: [], entries: [], settingsRecords: [] };
 
   rows.forEach((row) => {
     const type = row.type;
@@ -502,6 +508,10 @@ function parseBackupCsv(text) {
 
     if (type === "food") {
       next.foods.push(payload);
+    }
+
+    if (type === "recipe") {
+      next.recipes.push(payload);
     }
 
     if (type === "entry") {
@@ -780,6 +790,79 @@ function sumNutrition(entries) {
   );
 }
 
+function emptyNutrition() {
+  return { calories: 0, protein: 0, carbs: 0, fat: 0, fiber: 0 };
+}
+
+function scaleNutrition(nutrition, amount) {
+  const ratio = Number(amount);
+  const multiplier = Number.isFinite(ratio) && ratio > 0 ? ratio : 1;
+  return {
+    calories: Math.round((nutrition?.calories || 0) * multiplier),
+    protein: Number(((nutrition?.protein || 0) * multiplier).toFixed(1)),
+    carbs: Number(((nutrition?.carbs || 0) * multiplier).toFixed(1)),
+    fat: Number(((nutrition?.fat || 0) * multiplier).toFixed(1)),
+    fiber: Number(((nutrition?.fiber || 0) * multiplier).toFixed(1)),
+  };
+}
+
+function itemNutrition(item) {
+  return {
+    calories: item?.calories || 0,
+    protein: item?.protein || 0,
+    carbs: item?.carbs || 0,
+    fat: item?.fat || 0,
+    fiber: item?.fiber || 0,
+  };
+}
+
+function sumNutritionValues(values) {
+  return values.reduce((acc, nutrition) => {
+    acc.calories += nutrition.calories || 0;
+    acc.protein += nutrition.protein || 0;
+    acc.carbs += nutrition.carbs || 0;
+    acc.fat += nutrition.fat || 0;
+    acc.fiber += nutrition.fiber || 0;
+    return acc;
+  }, emptyNutrition());
+}
+
+function recipeNutrition(recipe, foodsById) {
+  const totals = sumNutritionValues((recipe?.ingredients || []).map((ingredient) => {
+    const food = foodsById[ingredient.foodId];
+    return scaleNutrition(itemNutrition(food), ingredient.quantity);
+  }));
+
+  return {
+    calories: Math.round(totals.calories),
+    protein: Number(totals.protein.toFixed(1)),
+    carbs: Number(totals.carbs.toFixed(1)),
+    fat: Number(totals.fat.toFixed(1)),
+    fiber: Number(totals.fiber.toFixed(1)),
+  };
+}
+
+function recipeToTrackable(recipe, foodsById) {
+  const nutrition = recipeNutrition(recipe, foodsById);
+  return {
+    ...recipe,
+    ...nutrition,
+    type: "recipe",
+    defaultServingLabel: recipe.defaultServingLabel || "1 porcao",
+  };
+}
+
+function foodToTrackable(food) {
+  return {
+    ...food,
+    type: "food",
+  };
+}
+
+function trackableLabel(item) {
+  return item?.type === "recipe" ? "Receita" : "Alimento";
+}
+
 function nutritionFromProduct(product) {
   const nutriments = product?.nutriments || {};
   const servingGrams = Number.parseFloat(product?.serving_quantity) || 100;
@@ -904,24 +987,22 @@ function buildHistory(entries) {
   return days;
 }
 
-function createEntry(food, mealType, multiplier) {
+function createEntry(item, mealType, multiplier) {
   const ratio = Number(multiplier);
   const amount = Number.isFinite(ratio) && ratio > 0 ? ratio : 1;
+  const itemType = item.type || "food";
+  const nutrition = itemNutrition(item);
   return {
     id: crypto.randomUUID(),
     date: todayKey(),
     mealType,
-    foodItemId: food.id,
+    itemType,
+    foodItemId: itemType === "food" ? item.id : undefined,
+    recipeId: itemType === "recipe" ? item.id : undefined,
     servingMultiplier: amount,
-    servingLabelSnapshot: food.defaultServingLabel,
-    foodNameSnapshot: food.name,
-    nutritionSnapshot: {
-      calories: Math.round(food.calories * amount),
-      protein: Number((food.protein * amount).toFixed(1)),
-      carbs: Number((food.carbs * amount).toFixed(1)),
-      fat: Number((food.fat * amount).toFixed(1)),
-      fiber: Number(((food.fiber || 0) * amount).toFixed(1)),
-    },
+    servingLabelSnapshot: item.defaultServingLabel || "1 porcao",
+    foodNameSnapshot: item.name,
+    nutritionSnapshot: scaleNutrition(nutrition, amount),
     createdAt: new Date().toISOString(),
   };
 }
@@ -1187,17 +1268,21 @@ function MealCard({
 }
 
 function SearchPanel({
-  foods,
+  items,
   query,
   setQuery,
   selectedMeal,
   setSelectedMeal,
-  onAddFood,
+  onAddItem,
   onToggleFavorite,
   onEditFood,
+  onEditRecipe,
+  onDeleteRecipe,
+  speechState,
+  onStartSearchSpeech,
 }) {
-  const filteredFoods = foods.filter((food) => {
-    const haystack = normalizeText(`${food.name} ${food.brand} ${food.barcode || ""}`);
+  const filteredItems = items.filter((item) => {
+    const haystack = normalizeText(`${item.name} ${item.brand || ""} ${item.barcode || ""} ${trackableLabel(item)}`);
     return haystack.includes(normalizeText(query));
   });
 
@@ -1217,7 +1302,34 @@ function SearchPanel({
           onChange={(event) => setQuery(event.target.value)}
           placeholder="Digite alimento ou marca"
         />
+        <button
+          type="button"
+          className={`voice-button search-voice-button ${speechState.field === "search" && speechState.status === "listening" ? "listening" : ""}`}
+          onClick={onStartSearchSpeech}
+          disabled={!speechState.supported && speechState.status !== "listening"}
+          aria-label="Buscar por voz"
+          title="Buscar por voz"
+        >
+          {speechState.field === "search" && speechState.status === "listening" ? "ouvindo" : "voz"}
+        </button>
       </label>
+
+      {speechState.field === "search" || speechState.error ? (
+        <div className="voice-card search-voice-card">
+          <div>
+            <p className="section-kicker">Busca por voz</p>
+            <strong>
+              {speechState.field === "search" && speechState.status === "listening"
+                ? "Fale o alimento ou receita"
+                : "Microfone pronto para a busca"}
+            </strong>
+          </div>
+          <span>
+            {speechState.field === "search" && speechState.status === "listening" ? "ouvindo" : speechState.supported ? "pronto" : "indisponivel"}
+          </span>
+          {speechState.error ? <p>{speechState.error}</p> : null}
+        </div>
+      ) : null}
 
       <label className="meal-select">
         Refeicao para lancamento
@@ -1228,25 +1340,30 @@ function SearchPanel({
         </select>
       </label>
 
-      {filteredFoods.length ? (
+      {filteredItems.length ? (
         <ul className="food-list">
-          {filteredFoods.map((food) => (
-            <li key={food.id}>
+          {filteredItems.map((item) => (
+            <li key={`${item.type}-${item.id}`}>
               <div>
-                <strong>{food.name}</strong>
-                <p>{food.brand || "Base propria"} · {food.defaultServingLabel}</p>
+                <strong>{item.name}</strong>
+                <p><span className={`type-pill ${item.type}`}>{trackableLabel(item)}</span> {item.brand || "Base propria"} · {item.defaultServingLabel}</p>
                 <small>
-                  {food.calories} kcal · P {decimalFormat(food.protein)}g · C {decimalFormat(food.carbs)}g · G {decimalFormat(food.fat)}g
+                  {item.calories} kcal · P {decimalFormat(item.protein)}g · C {decimalFormat(item.carbs)}g · G {decimalFormat(item.fat)}g
                 </small>
               </div>
               <div className="food-actions">
-                <button type="button" onClick={() => onEditFood(food)}>
+                <button type="button" onClick={() => item.type === "recipe" ? onEditRecipe(item) : onEditFood(item)}>
                   editar
                 </button>
-                <button type="button" onClick={() => onToggleFavorite(food.id)}>
-                  {food.isFavorite ? "desfavoritar" : "favoritar"}
+                {item.type === "recipe" ? (
+                  <button type="button" onClick={() => onDeleteRecipe(item.id)}>
+                    excluir
+                  </button>
+                ) : null}
+                <button type="button" onClick={() => onToggleFavorite(item.type, item.id)}>
+                  {item.isFavorite ? "desfavoritar" : "favoritar"}
                 </button>
-                <button type="button" onClick={() => onAddFood(food, selectedMeal)}>
+                <button type="button" onClick={() => onAddItem(item, selectedMeal)}>
                   + {mealLabels[selectedMeal]}
                 </button>
               </div>
@@ -1263,8 +1380,8 @@ function SearchPanel({
   );
 }
 
-function FavoritesPanel({ foods, onAddFood, onToggleFavorite, onEditFood, selectedMeal }) {
-  const favorites = foods.filter((food) => food.isFavorite);
+function FavoritesPanel({ items, onAddItem, onToggleFavorite, onEditFood, onEditRecipe, onDeleteRecipe, selectedMeal }) {
+  const favorites = items.filter((item) => item.isFavorite);
 
   return (
     <section className="tab-panel">
@@ -1277,21 +1394,26 @@ function FavoritesPanel({ foods, onAddFood, onToggleFavorite, onEditFood, select
 
       {favorites.length ? (
         <ul className="food-list">
-          {favorites.map((food) => (
-            <li key={food.id}>
+          {favorites.map((item) => (
+            <li key={`${item.type}-${item.id}`}>
               <div>
-                <strong>{food.name}</strong>
-                <p>{food.defaultServingLabel}</p>
-                <small>{food.calories} kcal por porcao</small>
+                <strong>{item.name}</strong>
+                <p><span className={`type-pill ${item.type}`}>{trackableLabel(item)}</span> {item.defaultServingLabel}</p>
+                <small>{item.calories} kcal por porcao</small>
               </div>
               <div className="food-actions">
-                <button type="button" onClick={() => onEditFood(food)}>
+                <button type="button" onClick={() => item.type === "recipe" ? onEditRecipe(item) : onEditFood(item)}>
                   editar
                 </button>
-                <button type="button" onClick={() => onToggleFavorite(food.id)}>
+                {item.type === "recipe" ? (
+                  <button type="button" onClick={() => onDeleteRecipe(item.id)}>
+                    excluir
+                  </button>
+                ) : null}
+                <button type="button" onClick={() => onToggleFavorite(item.type, item.id)}>
                   remover estrela
                 </button>
-                <button type="button" onClick={() => onAddFood(food, selectedMeal)}>
+                <button type="button" onClick={() => onAddItem(item, selectedMeal)}>
                   lancar agora
                 </button>
               </div>
@@ -1311,12 +1433,26 @@ function FavoritesPanel({ foods, onAddFood, onToggleFavorite, onEditFood, select
 function CreatePanel({
   draft,
   setDraft,
+  foods,
+  recipes,
+  recipeDraft,
+  setRecipeDraft,
+  activeCreateMode,
+  setActiveCreateMode,
   aiSettings,
   onFillFoodWithAi,
   onCreateFood,
+  onCreateRecipe,
   onCancelEditFood,
+  onCancelEditRecipe,
   editingFoodId,
+  editingRecipeId,
   duplicateError,
+  recipeError,
+  recipeTotals,
+  onEditRecipe,
+  onDeleteRecipe,
+  onToggleRecipeFavorite,
   barcodeFallback,
   ocrState,
   onSelectOcrImage,
@@ -1369,24 +1505,148 @@ function CreatePanel({
     <section className="tab-panel">
       <div className="section-head">
         <div>
-          <p className="section-kicker">{editingFoodId ? "Edicao" : "Cadastro"}</p>
-          <h2>{editingFoodId ? "Edite os atributos" : "Crie seus proprios alimentos"}</h2>
+          <p className="section-kicker">{editingFoodId || editingRecipeId ? "Edicao" : "Cadastro"}</p>
+          <h2>{activeCreateMode === "recipe" ? "Crie receitas" : editingFoodId ? "Edite os atributos" : "Crie seus proprios alimentos"}</h2>
         </div>
         {editingFoodId ? (
           <button className="section-toggle" type="button" onClick={onCancelEditFood}>
             cancelar
           </button>
+        ) : editingRecipeId ? (
+          <button className="section-toggle" type="button" onClick={onCancelEditRecipe}>
+            cancelar
+          </button>
         ) : null}
       </div>
 
-      {barcodeFallback ? (
+      <div className="create-tabs">
+        <button className={activeCreateMode === "food" ? "active" : ""} type="button" onClick={() => setActiveCreateMode("food")}>
+          Alimentos
+        </button>
+        <button className={activeCreateMode === "recipe" ? "active" : ""} type="button" onClick={() => setActiveCreateMode("recipe")}>
+          Receitas
+        </button>
+      </div>
+
+      {activeCreateMode === "recipe" ? (
+        <div className="recipe-workspace">
+          <form
+            className="food-form recipe-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              onCreateRecipe();
+            }}
+          >
+            <label>
+              Nome da receita
+              <input
+                value={recipeDraft.name}
+                onChange={(event) => setRecipeDraft((current) => ({ ...current, name: event.target.value }))}
+                placeholder="Ex.: Vitamina pos treino"
+              />
+            </label>
+            <div className="recipe-summary-card">
+              <span>Porcao base</span>
+              <strong>1 porcao</strong>
+              <small>{recipeTotals.calories} kcal · P {decimalFormat(recipeTotals.protein)}g · C {decimalFormat(recipeTotals.carbs)}g · G {decimalFormat(recipeTotals.fat)}g</small>
+            </div>
+            <div className="ingredient-builder">
+              <div className="section-head compact">
+                <div>
+                  <p className="section-kicker">Ingredientes</p>
+                  <h2>Alimentos da receita</h2>
+                </div>
+                <button
+                  className="section-toggle"
+                  type="button"
+                  onClick={() => setRecipeDraft((current) => ({
+                    ...current,
+                    ingredients: [...current.ingredients, { id: crypto.randomUUID(), foodId: foods[0]?.id || "", quantity: "1" }],
+                  }))}
+                  disabled={!foods.length}
+                >
+                  adicionar
+                </button>
+              </div>
+              {foods.length ? recipeDraft.ingredients.map((ingredient) => {
+                const food = foods.find((item) => item.id === ingredient.foodId);
+                const ingredientNutrition = scaleNutrition(itemNutrition(food), parseLocalizedNumber(ingredient.quantity));
+                return (
+                  <div key={ingredient.id} className="ingredient-row">
+                    <label>
+                      Alimento
+                      <select
+                        value={ingredient.foodId}
+                        onChange={(event) => setRecipeDraft((current) => ({
+                          ...current,
+                          ingredients: current.ingredients.map((item) => item.id === ingredient.id ? { ...item, foodId: event.target.value } : item),
+                        }))}
+                      >
+                        <option value="">Selecione</option>
+                        {foods.map((foodItem) => (
+                          <option key={foodItem.id} value={foodItem.id}>{foodItem.name} · {foodItem.defaultServingLabel}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      Quantidade
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        value={ingredient.quantity}
+                        onChange={(event) => setRecipeDraft((current) => ({
+                          ...current,
+                          ingredients: current.ingredients.map((item) => item.id === ingredient.id ? { ...item, quantity: event.target.value } : item),
+                        }))}
+                      />
+                    </label>
+                    <small>{ingredientNutrition.calories} kcal</small>
+                    <button
+                      type="button"
+                      onClick={() => setRecipeDraft((current) => ({ ...current, ingredients: current.ingredients.filter((item) => item.id !== ingredient.id) }))}
+                    >
+                      remover
+                    </button>
+                  </div>
+                );
+              }) : (
+                <div className="empty-state">Cadastre pelo menos um alimento antes de criar receitas.</div>
+              )}
+            </div>
+            {recipeError ? <div className="form-alert">{recipeError}</div> : null}
+            <button className="primary-cta" type="submit" disabled={!foods.length}>
+              <Icon name="pencil" />
+              {editingRecipeId ? "Atualizar receita" : "Salvar receita"}
+            </button>
+          </form>
+
+          <ul className="food-list recipe-list">
+            {recipes.length ? recipes.map((recipe) => (
+              <li key={recipe.id}>
+                <div>
+                  <strong>{recipe.name}</strong>
+                  <p>{recipe.defaultServingLabel || "1 porcao"} · {recipe.ingredients?.length || 0} ingredientes</p>
+                  <small>{recipe.calories || 0} kcal · P {decimalFormat(recipe.protein || 0)}g · C {decimalFormat(recipe.carbs || 0)}g · G {decimalFormat(recipe.fat || 0)}g</small>
+                </div>
+                <div className="food-actions">
+                  <button type="button" onClick={() => onEditRecipe(recipe)}>editar</button>
+                  <button type="button" onClick={() => onToggleRecipeFavorite(recipe.id)}>{recipe.isFavorite ? "desfavoritar" : "favoritar"}</button>
+                  <button type="button" onClick={() => onDeleteRecipe(recipe.id)}>excluir</button>
+                </div>
+              </li>
+            )) : <div className="empty-state">Nenhuma receita criada ainda.</div>}
+          </ul>
+        </div>
+      ) : null}
+
+      {activeCreateMode === "food" && barcodeFallback ? (
         <div className="ocr-notice">
           <strong>Produto nao encontrado pelo codigo {barcodeFallback}</strong>
           <p>Use uma foto da tabela nutricional para preencher os campos abaixo e revise antes de salvar.</p>
         </div>
       ) : null}
 
-      <form
+      {activeCreateMode === "food" ? <form
         className="food-form"
         onSubmit={(event) => {
           event.preventDefault();
@@ -1587,7 +1847,7 @@ function CreatePanel({
           <Icon name="pencil" />
           {editingFoodId ? "Atualizar alimento" : "Salvar alimento"}
         </button>
-      </form>
+      </form> : null}
     </section>
   );
 }
@@ -1981,6 +2241,7 @@ function ActionPanel({ setActiveTab, onScanBarcode }) {
 
 export function App() {
   const [foods, setFoods] = useState([]);
+  const [recipes, setRecipes] = useState([]);
   const [entries, setEntries] = useState([]);
   const [settings, setSettings] = useState(defaultSettings);
   const [activeTab, setActiveTab] = useState("today");
@@ -1989,6 +2250,9 @@ export function App() {
   const [query, setQuery] = useState("");
   const [duplicateError, setDuplicateError] = useState(false);
   const [editingFoodId, setEditingFoodId] = useState(null);
+  const [editingRecipeId, setEditingRecipeId] = useState(null);
+  const [activeCreateMode, setActiveCreateMode] = useState("food");
+  const [recipeError, setRecipeError] = useState("");
   const [barcodeFallback, setBarcodeFallback] = useState("");
   const [importStatus, setImportStatus] = useState("");
   const [ocrState, setOcrState] = useState({
@@ -2015,11 +2279,16 @@ export function App() {
     fat: "",
     fiber: "",
   });
+  const [recipeDraft, setRecipeDraft] = useState({
+    name: "",
+    ingredients: [],
+  });
 
   useEffect(() => {
     async function bootstrap() {
-      const [foodData, entryData, settingsData] = await Promise.all([
+      const [foodData, recipeData, entryData, settingsData] = await Promise.all([
         getAll(FOODS_STORE),
+        getAll(RECIPES_STORE),
         getAll(ENTRIES_STORE),
         getAll(SETTINGS_STORE),
       ]);
@@ -2032,12 +2301,14 @@ export function App() {
         await putItem(SETTINGS_STORE, { key: SEED_KEY, value: true });
         await putItem(SETTINGS_STORE, { key: "preferences", value: mergeSettings(defaultSettings) });
         setFoods(seedFoods);
+        setRecipes([]);
         setEntries([]);
         setSettings(mergeSettings(defaultSettings));
         return;
       }
 
       setFoods(foodData);
+      setRecipes(recipeData);
       setEntries(entryData);
       if (savedSettings?.value) {
         setSettings(mergeSettings(savedSettings.value));
@@ -2062,12 +2333,34 @@ export function App() {
   }, [entries]);
 
   useEffect(() => {
+    if (!recipes.length) {
+      return;
+    }
+    putMany(RECIPES_STORE, recipes).catch(() => {});
+  }, [recipes]);
+
+  useEffect(() => {
     putItem(SETTINGS_STORE, { key: "preferences", value: settings }).catch(() => {});
   }, [settings]);
 
   const foodsById = useMemo(
     () => Object.fromEntries(foods.map((food) => [food.id, food])),
     [foods],
+  );
+
+  const trackableRecipes = useMemo(
+    () => recipes.map((recipe) => recipeToTrackable(recipe, foodsById)),
+    [recipes, foodsById],
+  );
+
+  const trackableItems = useMemo(
+    () => [...trackableRecipes, ...foods.map(foodToTrackable)],
+    [foods, trackableRecipes],
+  );
+
+  const recipeTotals = useMemo(
+    () => recipeNutrition(recipeDraft, foodsById),
+    [recipeDraft, foodsById],
   );
 
   const todayEntries = useMemo(
@@ -2083,7 +2376,18 @@ export function App() {
     Math.round((totals.calories / Math.max(1, settings.dailyCalorieGoal)) * 100),
   );
 
-  const quickAdds = foods.filter((food) => quickAddIds.includes(food.id) || food.isFavorite).slice(0, 5);
+  const quickAdds = trackableItems
+    .filter((item) => item.isFavorite || (quickAddIds.includes(item.id) && item.id.startsWith("seed-")))
+    .slice(0, 5);
+
+  useEffect(() => {
+    setRecipeDraft((current) => {
+      if (current.ingredients.length || !foods.length) {
+        return current;
+      }
+      return { ...current, ingredients: [{ id: crypto.randomUUID(), foodId: foods[0].id, quantity: "1" }] };
+    });
+  }, [foods]);
 
   function toggleMeal(mealType) {
     setExpandedMeals((current) =>
@@ -2098,22 +2402,23 @@ export function App() {
     setActiveTab("search");
   }
 
-  async function addFood(food, mealType, forcedMultiplier, replaceEntryId = null) {
+  async function addFood(item, mealType, forcedMultiplier, replaceEntryId = null) {
     const amount =
       forcedMultiplier ??
-      Number(window.prompt(`Quantidade de ${food.defaultServingLabel} para ${mealLabels[mealType]}?`, "1"));
+      Number(window.prompt(`Quantidade de ${item.defaultServingLabel} para ${mealLabels[mealType]}?`, "1"));
 
     if (!amount || amount <= 0) {
       return;
     }
 
-    const nextEntry = createEntry(food, mealType, amount);
+    const nextEntry = createEntry(item, mealType, amount);
 
     if (replaceEntryId) {
       const updatedEntries = entries.map((entry) =>
         entry.id === replaceEntryId ? { ...nextEntry, id: replaceEntryId } : entry,
       );
       setEntries(updatedEntries);
+      setQuery("");
       setActiveTab("today");
       return;
     }
@@ -2121,6 +2426,7 @@ export function App() {
     const updatedEntries = [...entries, nextEntry];
     setEntries(updatedEntries);
     await putItem(ENTRIES_STORE, nextEntry);
+    setQuery("");
     setActiveTab("today");
     setExpandedMeals((current) => Array.from(new Set([...current, mealType])));
   }
@@ -2223,7 +2529,11 @@ export function App() {
       const value = mode === "number" ? numberFromSpeech(transcript) : transcript.trim();
 
       if (value) {
-        setDraft((current) => ({ ...current, [field]: value }));
+        if (field === "search") {
+          setQuery(value);
+        } else {
+          setDraft((current) => ({ ...current, [field]: value }));
+        }
       }
     };
 
@@ -2289,6 +2599,7 @@ export function App() {
       setEditingFoodId(null);
       resetDraft();
       setActiveTab("search");
+      setActiveCreateMode("food");
       return;
     }
 
@@ -2314,6 +2625,63 @@ export function App() {
     setBarcodeFallback("");
     clearOcr();
     setActiveTab("search");
+    setActiveCreateMode("food");
+  }
+
+  function resetRecipeDraft() {
+    setRecipeDraft({ name: "", ingredients: [] });
+  }
+
+  function createRecipe() {
+    setRecipeError("");
+    const trimmedName = recipeDraft.name.trim();
+    const validIngredients = recipeDraft.ingredients
+      .map((ingredient) => ({
+        ...ingredient,
+        quantity: parseLocalizedNumber(ingredient.quantity),
+      }))
+      .filter((ingredient) => ingredient.foodId && ingredient.quantity > 0);
+
+    if (!trimmedName) {
+      setRecipeError("Informe o nome da receita.");
+      return;
+    }
+
+    if (!validIngredients.length) {
+      setRecipeError("Adicione pelo menos um alimento com quantidade valida.");
+      return;
+    }
+
+    const exists = recipes.some((recipe) =>
+      recipe.id !== editingRecipeId && normalizeText(recipe.name) === normalizeText(trimmedName)
+    );
+    if (exists) {
+      setRecipeError("Ja existe uma receita com esse nome.");
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const baseRecipe = {
+      id: editingRecipeId || crypto.randomUUID(),
+      name: trimmedName,
+      brand: "Receita propria",
+      defaultServingLabel: "1 porcao",
+      ingredients: validIngredients,
+      isFavorite: recipes.find((recipe) => recipe.id === editingRecipeId)?.isFavorite || false,
+      createdAt: recipes.find((recipe) => recipe.id === editingRecipeId)?.createdAt || now,
+      updatedAt: now,
+    };
+    const nextRecipe = { ...baseRecipe, ...recipeNutrition(baseRecipe, foodsById) };
+
+    if (editingRecipeId) {
+      setRecipes((current) => current.map((recipe) => (recipe.id === editingRecipeId ? nextRecipe : recipe)));
+    } else {
+      setRecipes((current) => [nextRecipe, ...current]);
+    }
+
+    setEditingRecipeId(null);
+    resetRecipeDraft();
+    setActiveCreateMode("recipe");
   }
 
   function resetDraft() {
@@ -2345,6 +2713,7 @@ export function App() {
       fiber: food.fiber ?? "",
     });
     setActiveTab("create");
+    setActiveCreateMode("food");
   }
 
   function cancelEditFood() {
@@ -2352,6 +2721,39 @@ export function App() {
     setDuplicateError(false);
     resetDraft();
     setActiveTab("search");
+  }
+
+  function startEditRecipe(recipe) {
+    setEditingRecipeId(recipe.id);
+    setRecipeError("");
+    setRecipeDraft({
+      name: recipe.name || "",
+      ingredients: (recipe.ingredients || []).map((ingredient) => ({
+        id: ingredient.id || crypto.randomUUID(),
+        foodId: ingredient.foodId || "",
+        quantity: String(ingredient.quantity || "1").replace(".", ","),
+      })),
+    });
+    setActiveCreateMode("recipe");
+    setActiveTab("create");
+  }
+
+  function cancelEditRecipe() {
+    setEditingRecipeId(null);
+    setRecipeError("");
+    resetRecipeDraft();
+    setActiveCreateMode("recipe");
+  }
+
+  async function deleteRecipe(recipeId) {
+    if (!window.confirm("Excluir esta receita? Lancamentos antigos continuam no diario por snapshot.")) {
+      return;
+    }
+    setRecipes((current) => current.filter((recipe) => recipe.id !== recipeId));
+    await deleteItem(RECIPES_STORE, recipeId);
+    if (editingRecipeId === recipeId) {
+      cancelEditRecipe();
+    }
   }
 
   async function scanBarcode() {
@@ -2379,14 +2781,26 @@ export function App() {
       setEditingFoodId(null);
       setDraft((current) => ({ ...current, name: current.name || `Produto ${cleanBarcode}` }));
       clearOcr();
+      setActiveCreateMode("food");
       setActiveTab("create");
     }
   }
 
-  function toggleFavorite(foodId) {
+  function toggleFavorite(type, itemId) {
+    if (type === "recipe") {
+      setRecipes((current) =>
+        current.map((recipe) =>
+          recipe.id === itemId
+            ? { ...recipe, isFavorite: !recipe.isFavorite, updatedAt: new Date().toISOString() }
+            : recipe,
+        ),
+      );
+      return;
+    }
+
     setFoods((current) =>
       current.map((food) =>
-        food.id === foodId
+        food.id === itemId
           ? { ...food, isFavorite: !food.isFavorite, updatedAt: new Date().toISOString() }
           : food,
       ),
@@ -2402,11 +2816,18 @@ export function App() {
   }
 
   function editEntry(entry, food) {
-    addFood(food, entry.mealType, entry.servingMultiplier, entry.id);
+    const item = entry.itemType === "recipe"
+      ? trackableItems.find((trackable) => trackable.type === "recipe" && trackable.id === entry.recipeId)
+      : food;
+    if (!item) {
+      window.alert("Item original nao encontrado. Remova e lance novamente se necessario.");
+      return;
+    }
+    addFood(item, entry.mealType, entry.servingMultiplier, entry.id);
   }
 
   function exportCsv() {
-    const csv = buildBackupCsv({ foods, entries, settings });
+    const csv = buildBackupCsv({ foods, recipes, entries, settings });
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
@@ -2416,7 +2837,7 @@ export function App() {
     link.click();
     link.remove();
     URL.revokeObjectURL(url);
-    setImportStatus(`Exportado: ${foods.length} alimentos e ${entries.length} lancamentos.`);
+    setImportStatus(`Exportado: ${foods.length} alimentos, ${recipes.length} receitas e ${entries.length} lancamentos.`);
   }
 
   async function importCsv(event) {
@@ -2437,22 +2858,25 @@ export function App() {
 
       await Promise.all([
         clearStore(FOODS_STORE),
+        clearStore(RECIPES_STORE),
         clearStore(ENTRIES_STORE),
         clearStore(SETTINGS_STORE),
       ]);
 
       await Promise.all([
         putMany(FOODS_STORE, imported.foods),
+        putMany(RECIPES_STORE, imported.recipes || []),
         putMany(ENTRIES_STORE, imported.entries),
         putItem(SETTINGS_STORE, { key: SEED_KEY, value: true }),
         putItem(SETTINGS_STORE, { key: "preferences", value: imported.settings }),
       ]);
 
       setFoods(imported.foods);
+      setRecipes(imported.recipes || []);
       setEntries(imported.entries);
       setSettings(imported.settings);
       setActiveTab("profile");
-      setImportStatus(`Importado: ${imported.foods.length} alimentos e ${imported.entries.length} lancamentos.`);
+      setImportStatus(`Importado: ${imported.foods.length} alimentos, ${(imported.recipes || []).length} receitas e ${imported.entries.length} lancamentos.`);
     } catch (error) {
       setImportStatus(error.message || "Nao foi possivel importar o CSV.");
     }
@@ -2514,11 +2938,11 @@ export function App() {
             <span className="micro-tag">{mealLabels[selectedMeal]}</span>
           </div>
           <div className="quick-grid">
-            {quickAdds.map((food) => (
-              <button key={food.id} className="quick-card" type="button" onClick={() => addFood(food, selectedMeal)}>
-                <span>{food.name.split(" ")[0]}</span>
-                <strong>{food.name}</strong>
-                <small>{food.calories} kcal</small>
+            {quickAdds.map((item) => (
+              <button key={`${item.type}-${item.id}`} className="quick-card" type="button" onClick={() => addFood(item, selectedMeal)}>
+                <span>{trackableLabel(item)}</span>
+                <strong>{item.name}</strong>
+                <small>{item.calories} kcal</small>
               </button>
             ))}
             <button className="quick-card accent" type="button" onClick={() => setActiveTab("search")}>
@@ -2532,24 +2956,30 @@ export function App() {
 
         {activeTab === "search" ? (
           <SearchPanel
-            foods={foods}
+            items={trackableItems}
             query={query}
             setQuery={setQuery}
             selectedMeal={selectedMeal}
             setSelectedMeal={setSelectedMeal}
-            onAddFood={addFood}
+            onAddItem={addFood}
             onToggleFavorite={toggleFavorite}
             onEditFood={startEditFood}
+            onEditRecipe={startEditRecipe}
+            onDeleteRecipe={deleteRecipe}
+            speechState={speechState}
+            onStartSearchSpeech={() => startSpeechInput("search")}
           />
         ) : null}
 
         {activeTab === "favorites" ? (
           <FavoritesPanel
-            foods={foods}
+            items={trackableItems}
             selectedMeal={selectedMeal}
-            onAddFood={addFood}
+            onAddItem={addFood}
             onToggleFavorite={toggleFavorite}
             onEditFood={startEditFood}
+            onEditRecipe={startEditRecipe}
+            onDeleteRecipe={deleteRecipe}
           />
         ) : null}
 
@@ -2561,12 +2991,26 @@ export function App() {
           <CreatePanel
             draft={draft}
             setDraft={setDraft}
+            foods={foods}
+            recipes={trackableRecipes}
+            recipeDraft={recipeDraft}
+            setRecipeDraft={setRecipeDraft}
+            activeCreateMode={activeCreateMode}
+            setActiveCreateMode={setActiveCreateMode}
             aiSettings={settings.ai}
             onFillFoodWithAi={fillFoodWithAi}
             onCreateFood={createFood}
+            onCreateRecipe={createRecipe}
             onCancelEditFood={cancelEditFood}
+            onCancelEditRecipe={cancelEditRecipe}
             editingFoodId={editingFoodId}
+            editingRecipeId={editingRecipeId}
             duplicateError={duplicateError}
+            recipeError={recipeError}
+            recipeTotals={recipeTotals}
+            onEditRecipe={startEditRecipe}
+            onDeleteRecipe={deleteRecipe}
+            onToggleRecipeFavorite={(recipeId) => toggleFavorite("recipe", recipeId)}
             barcodeFallback={barcodeFallback}
             ocrState={ocrState}
             onSelectOcrImage={selectOcrImage}
